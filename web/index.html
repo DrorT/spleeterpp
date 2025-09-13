@@ -22,7 +22,7 @@
       const cancelBtn = document.getElementById("cancelBtn");
 
       const worker = new Worker("./js/worker.js", { type: "module" });
-      worker.onmessage = (e) => {
+      worker.onmessage = async (e) => {
         const { type, payload } = e.data || {};
         if (type === "planned") {
           cancelBtn.disabled = false;
@@ -37,6 +37,21 @@
         } else if (type === "done") {
           cancelBtn.disabled = true;
           log("Done");
+          // Quick listen: play first stem mono
+          try {
+            if (payload && payload.stems && payload.stems.length) {
+              const ctx = new (window.AudioContext || window.webkitAudioContext)();
+              const data = payload.stems[0];
+              const buffer = ctx.createBuffer(1, data.length, payload.sampleRate || 44100);
+              buffer.copyToChannel(data, 0, 0);
+              const src = ctx.createBufferSource();
+              src.buffer = buffer;
+              src.connect(ctx.destination);
+              src.start();
+            }
+          } catch (err) {
+            console.warn('Playback error', err);
+          }
         } else if (type === "error") {
           cancelBtn.disabled = true;
           log("Error: " + payload.message);
@@ -62,15 +77,12 @@
           const ab = await f.arrayBuffer();
           const pcm = await decodeArrayBufferToPCM(ab);
           const resampled = await resampleTo44100(pcm);
-          const frames =
-            resampled.channels && resampled.channels.length
-              ? resampled.channels[0].length
-              : 0;
+          const frames = resampled.channels?.[0]?.length || 0;
           const chunkSize = 44100 * 10; // 10s chunk
           const hopSize = 44100 * 5; // 50% overlap
           worker.postMessage({
             type: "process-audio",
-            payload: { sampleRate: 44100, frames, chunkSize, hopSize },
+            payload: { sampleRate: 44100, frames, chunkSize, hopSize, channels: resampled.channels, numStems: 2 },
           });
         };
       } catch (e) {

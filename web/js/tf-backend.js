@@ -1,7 +1,7 @@
 // TensorFlow.js backend configuration utilities
 // Loads TF.js from CDN and sets backend to WebGL (fallback CPU)
 
-async function ensureTF() {
+export async function ensureTF() {
   if (globalThis.tf) return globalThis.tf;
   await import(
     "https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.18.0/dist/tf.min.js"

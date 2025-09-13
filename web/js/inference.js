@@ -1,4 +1,5 @@
 // Inference adapter stub for TF.js models
+import { ensureTF } from './tf-backend.js';
 
 export class InferenceEngine {
   constructor(opts = {}) {
@@ -7,8 +8,9 @@ export class InferenceEngine {
   }
 
   async load(modelUrl) {
-    // TODO: integrate with TF.js (tf.loadGraphModel)
-    this.model = { url: modelUrl };
+    const tf = await ensureTF();
+    // TODO: integrate with tf.loadGraphModel and proper input/output mapping
+    this.model = { url: modelUrl, tfVersion: tf?.version?.tfjs };
   }
 
   isLoaded() {
@@ -16,7 +18,7 @@ export class InferenceEngine {
   }
 
   async runChunk(chunkPCM /* Float32Array */, sampleRate) {
-    // TODO: implement actual model inference
+    // TODO: implement actual model inference with tf.tidy
     return {
       stems: new Array(this.numStems)
         .fill(null)
