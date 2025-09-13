@@ -40,9 +40,14 @@
           // Quick listen: play first stem mono
           try {
             if (payload && payload.stems && payload.stems.length) {
-              const ctx = new (window.AudioContext || window.webkitAudioContext)();
+              const ctx = new (window.AudioContext ||
+                window.webkitAudioContext)();
               const data = payload.stems[0];
-              const buffer = ctx.createBuffer(1, data.length, payload.sampleRate || 44100);
+              const buffer = ctx.createBuffer(
+                1,
+                data.length,
+                payload.sampleRate || 44100
+              );
               buffer.copyToChannel(data, 0, 0);
               const src = ctx.createBufferSource();
               src.buffer = buffer;
@@ -50,7 +55,7 @@
               src.start();
             }
           } catch (err) {
-            console.warn('Playback error', err);
+            console.warn("Playback error", err);
           }
         } else if (type === "error") {
           cancelBtn.disabled = true;
@@ -82,7 +87,14 @@
           const hopSize = 44100 * 5; // 50% overlap
           worker.postMessage({
             type: "process-audio",
-            payload: { sampleRate: 44100, frames, chunkSize, hopSize, channels: resampled.channels, numStems: 2 },
+            payload: {
+              sampleRate: 44100,
+              frames,
+              chunkSize,
+              hopSize,
+              channels: resampled.channels,
+              numStems: 2,
+            },
           });
         };
       } catch (e) {

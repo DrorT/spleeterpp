@@ -1,5 +1,5 @@
 // Inference adapter stub for TF.js models
-import { ensureTF } from './tf-backend.js';
+import { ensureTF } from "./tf-backend.js";
 
 export class InferenceEngine {
   constructor(opts = {}) {

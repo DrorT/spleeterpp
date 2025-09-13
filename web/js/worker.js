@@ -1,7 +1,7 @@
 // Web Worker: orchestrates decode -> resample -> chunk -> (inference placeholder)
 
 import { planChunks, overlapAddStitchMono } from "./chunking.js";
-import { InferenceEngine } from './inference.js';
+import { InferenceEngine } from "./inference.js";
 
 let cancelRequested = false;
 
@@ -14,7 +14,14 @@ self.onmessage = async (e) => {
     case "process-audio": {
       cancelRequested = false;
       try {
-        const { sampleRate, frames, chunkSize, hopSize, channels, numStems = 2 } = payload;
+        const {
+          sampleRate,
+          frames,
+          chunkSize,
+          hopSize,
+          channels,
+          numStems = 2,
+        } = payload;
         const chunks = planChunks(frames, chunkSize, hopSize);
         self.postMessage({
           type: "planned",
@@ -32,8 +39,11 @@ self.onmessage = async (e) => {
           // Slice mono channel for now (first channel)
           const mono = channels[0].subarray(c.start, c.end);
           // Placeholder inference: pass-through; later call await engine.runChunk(mono, sampleRate)
-          const result = { stems: new Array(numStems).fill(null).map(() => mono) };
-          for (let s = 0; s < numStems; s++) perStemOutputs[s].push(result.stems[s]);
+          const result = {
+            stems: new Array(numStems).fill(null).map(() => mono),
+          };
+          for (let s = 0; s < numStems; s++)
+            perStemOutputs[s].push(result.stems[s]);
           await new Promise((r) => setTimeout(r, 0));
           self.postMessage({
             type: "progress",
@@ -49,7 +59,10 @@ self.onmessage = async (e) => {
         const stitched = perStemOutputs.map((chunks) =>
           overlapAddStitchMono(chunks, frames, chunkSize, hopSize)
         );
-        self.postMessage({ type: "done", payload: { stems: stitched, sampleRate } });
+        self.postMessage({
+          type: "done",
+          payload: { stems: stitched, sampleRate },
+        });
       } catch (err) {
         self.postMessage({
           type: "error",

@@ -1,4 +1,4 @@
-import { ensureTF } from './tf-backend.js';
+import { ensureTF } from "./tf-backend.js";
 
 export async function loadGraphModelWithCache(url, opts = {}) {
   const tf = await ensureTF();
@@ -9,7 +9,7 @@ export async function loadGraphModelWithCache(url, opts = {}) {
   if (opts.warmup) {
     const dummy = tf.zeros([1, 1024, 2]); // placeholder shape; adjust later once model IO is known
     const out = model.execute({ input_audio: dummy });
-    if (out && typeof out.dispose === 'function') out.dispose();
+    if (out && typeof out.dispose === "function") out.dispose();
     dummy.dispose();
   }
   return model;

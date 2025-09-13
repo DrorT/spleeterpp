@@ -27,7 +27,8 @@ export function overlapAddStitchMono(outputs, totalFrames, chunkSize, hopSize) {
       if (fade > 0) {
         if (i < half) w = i / half;
         else if (i > chunk.length - 1 - half) w = (chunk.length - 1 - i) / half;
-        if (w < 0) w = 0; if (w > 1) w = 1;
+        if (w < 0) w = 0;
+        if (w > 1) w = 1;
       }
       out[pos] += chunk[i] * w;
       acc[pos] += w;
