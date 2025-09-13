@@ -1,5 +1,6 @@
 #include "spleeter_common/tf_handle.h"
 
+#ifndef __EMSCRIPTEN__
 namespace spleeter {
 
 void SessionDeleter(TF_Session* ptr) {
@@ -11,3 +12,4 @@ void SessionDeleter(TF_Session* ptr) {
 }
 
 }  // namespace spleeter
+#endif

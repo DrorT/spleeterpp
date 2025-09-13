@@ -5,7 +5,9 @@
 #include <functional>
 #include <iostream>
 
+#ifndef __EMSCRIPTEN__
 #include <tensorflow/c/c_api.h>
+#endif
 
 namespace spleeter {
 
@@ -36,7 +38,9 @@ TFHandlePtr<T> MakeHandle(T* ptr, void (deleter)(T*)) {
   return std::make_shared<TFHandle<T>>(ptr, deleter);
 }
 
+#ifndef __EMSCRIPTEN__
 void SessionDeleter(TF_Session* ptr);
+#endif
 
 }  // namespace spleeter
 

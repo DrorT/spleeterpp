@@ -1,5 +1,11 @@
 # Download the exported models and unzip it
-set(spleeter_env_dir ${CMAKE_CURRENT_BINARY_DIR}/models)
+# Use a persistent cache directory under the project root to avoid re-downloading.
+if (DEFINED PROJECT_SOURCE_DIR)
+  set(spleeter_cache_root ${PROJECT_SOURCE_DIR}/.cache)
+else()
+  set(spleeter_cache_root ${CMAKE_SOURCE_DIR}/.cache)
+endif()
+set(spleeter_env_dir ${spleeter_cache_root}/models)
 file(MAKE_DIRECTORY ${spleeter_env_dir})
 
 # ----------------------------------

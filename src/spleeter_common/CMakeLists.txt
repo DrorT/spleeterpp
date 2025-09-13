@@ -8,10 +8,16 @@ add_library(spleeter_common
   spleeter_common.cc
 )
 
-target_link_libraries(spleeter_common
-  tensorflow
-  Eigen3::Eigen
-)
+if (EMSCRIPTEN)
+  target_link_libraries(spleeter_common
+    Eigen3::Eigen
+  )
+else()
+  target_link_libraries(spleeter_common
+    tensorflow
+    Eigen3::Eigen
+  )
+endif()
 
 install(TARGETS spleeter_common
   RUNTIME DESTINATION bin
