@@ -3,6 +3,7 @@
 
 #include <vector>
 #include <complex>
+#include <cstdint>
 
 namespace artff {
 class CircularFrameBuffer {

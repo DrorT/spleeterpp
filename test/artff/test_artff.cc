@@ -1,6 +1,8 @@
 #include <gtest/gtest.h>
 #include "wave/file.h"
 #include "artff/abstract_filter.h"
+#include <thread>
+#include <chrono>
 
 class MyFilter : public artff::AbstractFilter {
 private:
@@ -45,4 +47,3 @@ TEST(ARTFF, Basic) {
   result_file.set_channel_number(2);
   result_file.Write(data);
 }
-
