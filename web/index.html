@@ -54,7 +54,7 @@
     </div>
     <pre id="log">Loading...</pre>
     <script type="module">
-      import { createSpleeterWasm } from "./js/spleeter-wasm.js";
+      // import { createSpleeterWasm } from "./js/spleeter-wasm.js";
       import { resampleTo44100, decodeArrayBufferToPCM } from "./js/audio.js";
 
       const logEl = document.getElementById("log");
@@ -262,14 +262,14 @@
       cancelBtn.onclick = () => worker.postMessage({ type: "cancel" });
 
       try {
-        const api = await createSpleeterWasm({
-          moduleUrl: "/wasm/spleeter.js",
-        });
-        log("Module loaded");
-        const v = await api.version();
-        log(`sp_version: ${v}`);
-        const rc = await api.init({ sampleRate: 44100, channels: 2 });
-        log(`sp_init rc=${rc}`);
+        // const api = await createSpleeterWasm({
+        //   moduleUrl: "/wasm/spleeter.js",
+        // });
+        // log("Module loaded");
+        // const v = await api.version();
+        // log(`sp_version: ${v}`);
+        // const rc = await api.init({ sampleRate: 44100, channels: 2 });
+        // log(`sp_init rc=${rc}`);
 
         fileInput.onchange = async () => {
           const f = fileInput.files && fileInput.files[0];
