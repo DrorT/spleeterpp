@@ -5,18 +5,41 @@ import { InferenceEngine } from "./inference.js";
 
 let cancelRequested = false;
 
+// Signal readiness as soon as the module loads
+self.postMessage({ type: "worker-ready" });
+
 self.onmessage = async (e) => {
   const { type, payload } = e.data || {};
+  self.postMessage({
+    type: "debug",
+    payload: { message: `Worker received message: ${type}` },
+  });
   switch (type) {
     case "load-model": {
       try {
         const stems = Number(payload?.stems || 2);
+        self.postMessage({ type: "model-loading", payload: { stems } });
         const engine = new InferenceEngine({ numStems: stems });
         const info = await engine.load(stems);
         // cache current engine by stems count if needed later
         self._engines = self._engines || new Map();
         self._engines.set(stems, engine);
-        self.postMessage({ type: "model-loaded", payload: { stems, info } });
+        const ioDetail = {
+          inputs: (engine.model?.inputs || []).map((t) => ({
+            name: t?.name,
+            dtype: t?.dtype,
+            shape: t?.shape,
+          })),
+          outputs: (engine.model?.outputs || []).map((t) => ({
+            name: t?.name,
+            dtype: t?.dtype,
+            shape: t?.shape,
+          })),
+        };
+        self.postMessage({
+          type: "model-loaded",
+          payload: { stems, info, ioDetail },
+        });
       } catch (err) {
         self.postMessage({
           type: "error",
@@ -30,6 +53,7 @@ self.onmessage = async (e) => {
     }
     case "preload-all-models": {
       try {
+        self.postMessage({ type: "preload-start" });
         const stemsList = payload?.stemsList || [2, 4, 5];
         self._engines = self._engines || new Map();
         const results = [];
@@ -75,6 +99,10 @@ self.onmessage = async (e) => {
           channels,
           numStems = 2,
         } = payload;
+        self.postMessage({
+          type: "processing-start",
+          payload: { frames, chunkSize, hopSize, numStems },
+        });
         const chunks = planChunks(frames, chunkSize, hopSize);
         self.postMessage({
           type: "planned",
@@ -95,12 +123,9 @@ self.onmessage = async (e) => {
             return;
           }
           const c = chunks[i];
-          // Slice mono channel for now (first channel)
-          const mono = channels[0].subarray(c.start, c.end);
-          // Placeholder inference: pass-through; later call await engine.runChunk(mono, sampleRate)
-          const result = {
-            stems: new Array(numStems).fill(null).map(() => mono),
-          };
+          // Slice channels per chunk
+          const slice = channels.map((ch) => ch.subarray(c.start, c.end));
+          const result = await engine.runChunk(slice, sampleRate);
           for (let s = 0; s < numStems; s++)
             perStemOutputs[s].push(result.stems[s]);
           await new Promise((r) => setTimeout(r, 0));

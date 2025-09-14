@@ -34,10 +34,38 @@
       const loadModelBtn = document.getElementById("loadModelBtn");
       const preloadAllBtn = document.getElementById("preloadAllBtn");
 
-      const worker = new Worker("./js/worker.js", { type: "module" });
+      const workerUrl = new URL("./js/worker.js", import.meta.url);
+      const worker = new Worker(workerUrl, { type: "module" });
+      log("Worker created (module)");
+      worker.addEventListener("error", (ev) => {
+        log(
+          "Worker error: " + (ev?.message || ev?.error?.message || String(ev))
+        );
+        console.error("Worker error", ev);
+      });
+      worker.addEventListener("messageerror", (ev) => {
+        log("Worker messageerror: " + String(ev?.data ?? ""));
+        console.error("Worker messageerror", ev);
+      });
       worker.onmessage = async (e) => {
         const { type, payload } = e.data || {};
-        if (type === "planned") {
+        if (type === "worker-ready") {
+          log("Worker ready");
+          return;
+        }
+        if (type === "debug") {
+          if (payload?.message) log(`[worker] ${payload.message}`);
+          return;
+        }
+        if (type === "model-loading") {
+          log(`Loading model for ${payload.stems} stems...`);
+        } else if (type === "preload-start") {
+          log("Preloading models...");
+        } else if (type === "processing-start") {
+          log(
+            `Processing: frames=${payload.frames}, chunk=${payload.chunkSize}, hop=${payload.hopSize}, stems=${payload.numStems}`
+          );
+        } else if (type === "planned") {
           cancelBtn.disabled = false;
           log(`Planned ${payload.total} chunks...`);
         } else if (type === "progress") {
@@ -71,7 +99,7 @@
             console.warn("Playback error", err);
           }
         } else if (type === "model-loaded") {
-          const { stems, info } = payload;
+          const { stems, info, ioDetail } = payload;
           log(`Model loaded: ${stems} stems @ ${info.backend}`);
           if (info.url) log(`URL: ${info.url}`);
           if (info.io && (info.io.inputs?.length || info.io.outputs?.length)) {
@@ -80,6 +108,16 @@
                 ", "
               )}], outputs=[${info.io.outputs.join(", ")}]`
             );
+          }
+          if (ioDetail) {
+            const ins = (ioDetail.inputs || [])
+              .map((t) => `${t.name}:{${t.dtype}}${JSON.stringify(t.shape)}`)
+              .join(", ");
+            const outs = (ioDetail.outputs || [])
+              .map((t) => `${t.name}:{${t.dtype}}${JSON.stringify(t.shape)}`)
+              .join(", ");
+            log(`IO detail: inputs=[${ins}]`);
+            log(`IO detail: outputs=[${outs}]`);
           }
         } else if (type === "model-progress") {
           log(
@@ -99,10 +137,12 @@
       };
 
       loadModelBtn.onclick = () => {
+        log("Load Model clicked");
         const stems = Number(stemsSelect.value);
         worker.postMessage({ type: "load-model", payload: { stems } });
       };
       preloadAllBtn.onclick = () => {
+        log("Preload All clicked");
         worker.postMessage({
           type: "preload-all-models",
           payload: { stemsList: [2, 4, 5] },
