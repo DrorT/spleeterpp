@@ -78,18 +78,40 @@
         } else if (type === "done") {
           cancelBtn.disabled = true;
           log("Done");
+          if (payload?.stats) {
+            payload.stats.forEach((s, i) =>
+              log(
+                `Stem ${i + 1}: len=${s.len} min=${s.min.toFixed(
+                  4
+                )} max=${s.max.toFixed(4)} rms=${s.rms.toFixed(6)} nz=${(
+                  s.nzFrac * 100
+                ).toFixed(2)}%`
+              )
+            );
+          }
           // Quick listen: play first stem mono
           try {
             if (payload && payload.stems && payload.stems.length) {
               const ctx = new (window.AudioContext ||
                 window.webkitAudioContext)();
+              if (ctx.state === "suspended") await ctx.resume();
               const data = payload.stems[0];
+              const nonZero = data.some((v) => v !== 0);
+              log(`First stem preview: len=${data.length} nonZero=${nonZero}`);
+              let playData = data;
+              if (!nonZero && data.length > 0) {
+                // synthesize a short blip so we know playback works
+                const L = Math.min(4410, data.length); // 0.1s
+                playData = new Float32Array(data.length);
+                for (let i = 0; i < L; i++)
+                  playData[i] = Math.sin((i / L) * Math.PI);
+              }
               const buffer = ctx.createBuffer(
                 1,
-                data.length,
+                playData.length,
                 payload.sampleRate || 44100
               );
-              buffer.copyToChannel(data, 0, 0);
+              buffer.copyToChannel(playData, 0, 0);
               const src = ctx.createBufferSource();
               src.buffer = buffer;
               src.connect(ctx.destination);
@@ -168,6 +190,50 @@
           const ab = await f.arrayBuffer();
           const pcm = await decodeArrayBufferToPCM(ab);
           const resampled = await resampleTo44100(pcm);
+          // Log input stats
+          const statsCh = (arr) => {
+            const n = arr.length;
+            const maxSamples = 200000;
+            const stride = n > maxSamples ? Math.ceil(n / maxSamples) : 1;
+            let min = Infinity,
+              max = -Infinity,
+              sumSq = 0,
+              nz = 0,
+              count = 0;
+            for (let i = 0; i < n; i += stride) {
+              const v = arr[i];
+              if (v < min) min = v;
+              if (v > max) max = v;
+              sumSq += v * v;
+              if (v !== 0) nz++;
+              count++;
+            }
+            const rms = Math.sqrt(sumSq / Math.max(1, count));
+            const nzFrac = count ? nz / count : 0;
+            return { len: n, min, max, rms, nzFrac };
+          };
+          const ch0 = resampled.channels?.[0];
+          if (ch0) {
+            const s0 = statsCh(ch0);
+            log(
+              `Input Ch1: len=${s0.len} min=${s0.min.toFixed(
+                4
+              )} max=${s0.max.toFixed(4)} rms=${s0.rms.toFixed(6)} nz=${(
+                s0.nzFrac * 100
+              ).toFixed(2)}%`
+            );
+          }
+          const ch1 = resampled.channels?.[1];
+          if (ch1) {
+            const s1 = statsCh(ch1);
+            log(
+              `Input Ch2: len=${s1.len} min=${s1.min.toFixed(
+                4
+              )} max=${s1.max.toFixed(4)} rms=${s1.rms.toFixed(6)} nz=${(
+                s1.nzFrac * 100
+              ).toFixed(2)}%`
+            );
+          }
           const frames = resampled.channels?.[0]?.length || 0;
           const chunkSize = 44100 * 10; // 10s chunk
           const hopSize = 44100 * 5; // 50% overlap

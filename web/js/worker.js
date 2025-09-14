@@ -143,9 +143,31 @@ self.onmessage = async (e) => {
         const stitched = perStemOutputs.map((chunks) =>
           overlapAddStitchMono(chunks, frames, chunkSize, hopSize)
         );
+        const computeStats = (arr) => {
+          const n = arr.length;
+          const maxSamples = 200000;
+          const stride = n > maxSamples ? Math.ceil(n / maxSamples) : 1;
+          let min = Infinity,
+            max = -Infinity,
+            sumSq = 0,
+            count = 0,
+            nz = 0;
+          for (let i = 0; i < n; i += stride) {
+            const v = arr[i];
+            if (v < min) min = v;
+            if (v > max) max = v;
+            sumSq += v * v;
+            if (v !== 0) nz++;
+            count++;
+          }
+          const rms = Math.sqrt(sumSq / Math.max(1, count));
+          const nzFrac = count ? nz / count : 0;
+          return { len: n, min, max, rms, nzFrac };
+        };
+        const stats = stitched.map((a) => computeStats(a));
         self.postMessage({
           type: "done",
-          payload: { stems: stitched, sampleRate },
+          payload: { stems: stitched, sampleRate, stats },
         });
       } catch (err) {
         self.postMessage({
