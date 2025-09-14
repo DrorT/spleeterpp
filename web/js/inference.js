@@ -72,6 +72,12 @@ export class InferenceEngine {
   }
 
   async runChunk(channelsOrMono, sampleRate, opts = {}) {
+    // Yield to the event loop before the heavy execution part
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    return this._runChunkInternal(channelsOrMono, sampleRate, opts);
+  }
+
+  async _runChunkInternal(channelsOrMono, sampleRate, opts = {}) {
     const tf = await ensureTF();
     const precision = opts?.precision || "auto";
     const tAll0 =
@@ -98,6 +104,7 @@ export class InferenceEngine {
         } catch (_) {}
       }
     };
+
     const channels = Array.isArray(channelsOrMono)
       ? channelsOrMono
       : [channelsOrMono];
@@ -590,6 +597,25 @@ export class InferenceEngine {
       }
       return dict;
     };
+    // Helper to run model with timeout to avoid indefinite GPU hangs
+    const doExec = (dict, fetches) =>
+      this.model.executeAsync
+        ? this.model.executeAsync(dict, fetches)
+        : this.model.execute
+        ? this.model.execute(dict, fetches)
+        : this.model.predict(dict);
+    const withTimeout = async (factory, ms, label) => {
+      let to;
+      const timeout = new Promise((_, rej) => {
+        to = setTimeout(() => rej(new Error(`exec timeout (${label})`)), ms);
+      });
+      try {
+        return await Promise.race([factory(), timeout]);
+      } finally {
+        clearTimeout(to);
+      }
+    };
+    const EXEC_TIMEOUT_MS = 6000;
     // Log which input we chose for audio and what we fed others (once)
     if (!this._loggedInputsOnce) {
       const audioName = audioInputInfo?.name || "<unknown>";
@@ -638,6 +664,14 @@ export class InferenceEngine {
           if (tf.getBackend() === "webgl") {
             triedWebGL = true;
             execBackend = "webgl";
+            try {
+              const fp =
+                tf.backend() &&
+                typeof tf.backend().floatPrecision === "function"
+                  ? tf.backend().floatPrecision()
+                  : undefined;
+              dbg("inference.js:exec", `webgl active; floatPrecision=${fp}`);
+            } catch (_) {}
           } else {
             dbg(
               "inference.js:exec",
@@ -671,11 +705,11 @@ export class InferenceEngine {
           `execute minimal+fetches (backend=${tf.getBackend()})`
         );
         try {
-          raw = this.model.executeAsync
-            ? await this.model.executeAsync(minimalInputs, fetches)
-            : this.model.execute
-            ? this.model.execute(minimalInputs, fetches)
-            : this.model.predict(minimalInputs);
+          raw = await withTimeout(
+            () => doExec(minimalInputs, fetches),
+            EXEC_TIMEOUT_MS,
+            "webgl:minimal+fetches"
+          );
           usedPath = "minimal+fetches";
         } catch (ex) {
           dbg(
@@ -699,11 +733,7 @@ export class InferenceEngine {
                 ? performance.now()
                 : Date.now();
             dbg("inference.js:exec", `retry minimal+fetches on cpu`);
-            raw = this.model.executeAsync
-              ? await this.model.executeAsync(minimalInputs, fetches)
-              : this.model.execute
-              ? this.model.execute(minimalInputs, fetches)
-              : this.model.predict(minimalInputs);
+            raw = await doExec(minimalInputs, fetches);
             const tRetry1 =
               typeof performance !== "undefined" && performance.now
                 ? performance.now()
@@ -727,11 +757,11 @@ export class InferenceEngine {
           materializeFeaturesInto(minimalInputs, complexNames, mag4dNames);
         }
         try {
-          raw = this.model.executeAsync
-            ? await this.model.executeAsync(minimalInputs)
-            : this.model.execute
-            ? this.model.execute(minimalInputs)
-            : this.model.predict(minimalInputs);
+          raw = await withTimeout(
+            () => doExec(minimalInputs),
+            EXEC_TIMEOUT_MS,
+            "webgl:minimal"
+          );
         } catch (ex) {
           dbg(
             "inference.js:exec",
@@ -752,11 +782,7 @@ export class InferenceEngine {
                 ? performance.now()
                 : Date.now();
             dbg("inference.js:exec", `retry minimal on cpu`);
-            raw = this.model.executeAsync
-              ? await this.model.executeAsync(minimalInputs)
-              : this.model.execute
-              ? this.model.execute(minimalInputs)
-              : this.model.predict(minimalInputs);
+            raw = await doExec(minimalInputs);
             const tRetry1 =
               typeof performance !== "undefined" && performance.now
                 ? performance.now()
@@ -863,11 +889,11 @@ export class InferenceEngine {
           `execute all+fetches (backend=${tf.getBackend()})`
         );
         try {
-          raw = this.model.executeAsync
-            ? await this.model.executeAsync(inputsDict, fetches)
-            : this.model.execute
-            ? this.model.execute(inputsDict, fetches)
-            : this.model.predict(inputsDict);
+          raw = await withTimeout(
+            () => doExec(inputsDict, fetches),
+            EXEC_TIMEOUT_MS,
+            "webgl:all+fetches"
+          );
           usedPath = "all+fetches";
         } catch (ex) {
           dbg(
@@ -894,11 +920,7 @@ export class InferenceEngine {
                 ? performance.now()
                 : Date.now();
             dbg("inference.js:exec", `retry all+fetches on cpu`);
-            raw = this.model.executeAsync
-              ? await this.model.executeAsync(inputsDict, fetches)
-              : this.model.execute
-              ? this.model.execute(inputsDict, fetches)
-              : this.model.predict(inputsDict);
+            raw = await doExec(inputsDict, fetches);
             const tRetry1 =
               typeof performance !== "undefined" && performance.now
                 ? performance.now()
@@ -918,11 +940,11 @@ export class InferenceEngine {
           materializeFeaturesInto(inputsDict, allComplexNames, allMag4dNames);
         }
         try {
-          raw = this.model.executeAsync
-            ? await this.model.executeAsync(inputsDict)
-            : this.model.execute
-            ? this.model.execute(inputsDict)
-            : this.model.predict(inputsDict);
+          raw = await withTimeout(
+            () => doExec(inputsDict),
+            EXEC_TIMEOUT_MS,
+            "webgl:all"
+          );
         } catch (ex) {
           dbg(
             "inference.js:exec",
@@ -945,11 +967,7 @@ export class InferenceEngine {
                 ? performance.now()
                 : Date.now();
             dbg("inference.js:exec", `retry all on cpu`);
-            raw = this.model.executeAsync
-              ? await this.model.executeAsync(inputsDict)
-              : this.model.execute
-              ? this.model.execute(inputsDict)
-              : this.model.predict(inputsDict);
+            raw = await doExec(inputsDict);
             const tRetry1 =
               typeof performance !== "undefined" && performance.now
                 ? performance.now()
