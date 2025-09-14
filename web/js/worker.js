@@ -8,6 +8,59 @@ let cancelRequested = false;
 self.onmessage = async (e) => {
   const { type, payload } = e.data || {};
   switch (type) {
+    case "load-model": {
+      try {
+        const stems = Number(payload?.stems || 2);
+        const engine = new InferenceEngine({ numStems: stems });
+        const info = await engine.load(stems);
+        // cache current engine by stems count if needed later
+        self._engines = self._engines || new Map();
+        self._engines.set(stems, engine);
+        self.postMessage({ type: "model-loaded", payload: { stems, info } });
+      } catch (err) {
+        self.postMessage({
+          type: "error",
+          payload: {
+            message:
+              "Model load failed: " + ((err && err.message) || String(err)),
+          },
+        });
+      }
+      return;
+    }
+    case "preload-all-models": {
+      try {
+        const stemsList = payload?.stemsList || [2, 4, 5];
+        self._engines = self._engines || new Map();
+        const results = [];
+        for (let i = 0; i < stemsList.length; i++) {
+          const stems = stemsList[i];
+          let ok = true;
+          let info = null;
+          try {
+            const engine = new InferenceEngine({ numStems: stems });
+            info = await engine.load(stems);
+            self._engines.set(stems, engine);
+          } catch (e) {
+            ok = false;
+          }
+          results.push({ stems, ok });
+          self.postMessage({
+            type: "model-progress",
+            payload: { index: i + 1, total: stemsList.length, stems, ok },
+          });
+        }
+        self.postMessage({ type: "models-preloaded", payload: { results } });
+      } catch (err) {
+        self.postMessage({
+          type: "error",
+          payload: {
+            message: "Preload failed: " + ((err && err.message) || String(err)),
+          },
+        });
+      }
+      return;
+    }
     case "cancel":
       cancelRequested = true;
       return;
@@ -27,8 +80,14 @@ self.onmessage = async (e) => {
           type: "planned",
           payload: { total: chunks.length },
         });
-        const engine = new InferenceEngine({ numStems });
-        // engine.load(modelUrl) // TODO when model loader is ready
+        // Use cached engine if available or create fresh
+        self._engines = self._engines || new Map();
+        let engine = self._engines.get(numStems);
+        if (!engine) {
+          engine = new InferenceEngine({ numStems });
+          await engine.load(numStems);
+          self._engines.set(numStems, engine);
+        }
         const perStemOutputs = new Array(numStems).fill(null).map(() => []);
         for (let i = 0; i < chunks.length; i++) {
           if (cancelRequested) {

@@ -11,6 +11,16 @@
       <input id="fileInput" type="file" accept="audio/*" />
       <button id="cancelBtn" disabled>Cancel</button>
     </div>
+    <div style="margin-top: 8px">
+      <label for="stemsSelect">Stems:</label>
+      <select id="stemsSelect">
+        <option value="2" selected>2 stems</option>
+        <option value="4">4 stems</option>
+        <option value="5">5 stems</option>
+      </select>
+      <button id="loadModelBtn">Load Model</button>
+      <button id="preloadAllBtn">Preload All</button>
+    </div>
     <pre id="log">Loading...</pre>
     <script type="module">
       import { createSpleeterWasm } from "./js/spleeter-wasm.js";
@@ -20,6 +30,9 @@
       const log = (m) => (logEl.textContent += `\n${m}`);
       const fileInput = document.getElementById("fileInput");
       const cancelBtn = document.getElementById("cancelBtn");
+      const stemsSelect = document.getElementById("stemsSelect");
+      const loadModelBtn = document.getElementById("loadModelBtn");
+      const preloadAllBtn = document.getElementById("preloadAllBtn");
 
       const worker = new Worker("./js/worker.js", { type: "module" });
       worker.onmessage = async (e) => {
@@ -57,17 +70,50 @@
           } catch (err) {
             console.warn("Playback error", err);
           }
+        } else if (type === "model-loaded") {
+          const { stems, info } = payload;
+          log(`Model loaded: ${stems} stems @ ${info.backend}`);
+          if (info.url) log(`URL: ${info.url}`);
+          if (info.io && (info.io.inputs?.length || info.io.outputs?.length)) {
+            log(
+              `IO: inputs=[${info.io.inputs.join(
+                ", "
+              )}], outputs=[${info.io.outputs.join(", ")}]`
+            );
+          }
+        } else if (type === "model-progress") {
+          log(
+            `Preload ${payload.index}/${payload.total}: ${
+              payload.stems
+            } stems ${payload.ok ? "OK" : "FAIL"}`
+          );
+        } else if (type === "models-preloaded") {
+          const okCount = (payload.results || []).filter((r) => r.ok).length;
+          log(
+            `Preload complete: ${okCount}/${payload.results.length} models loaded`
+          );
         } else if (type === "error") {
           cancelBtn.disabled = true;
           log("Error: " + payload.message);
         }
       };
 
+      loadModelBtn.onclick = () => {
+        const stems = Number(stemsSelect.value);
+        worker.postMessage({ type: "load-model", payload: { stems } });
+      };
+      preloadAllBtn.onclick = () => {
+        worker.postMessage({
+          type: "preload-all-models",
+          payload: { stemsList: [2, 4, 5] },
+        });
+      };
+
       cancelBtn.onclick = () => worker.postMessage({ type: "cancel" });
 
       try {
         const api = await createSpleeterWasm({
-          moduleUrl: "/build-wasm/src/wasm/spleeter.js",
+          moduleUrl: "/wasm/spleeter.js",
         });
         log("Module loaded");
         const v = await api.version();
@@ -85,6 +131,7 @@
           const frames = resampled.channels?.[0]?.length || 0;
           const chunkSize = 44100 * 10; // 10s chunk
           const hopSize = 44100 * 5; // 50% overlap
+          const stems = Number(stemsSelect.value);
           worker.postMessage({
             type: "process-audio",
             payload: {
@@ -93,7 +140,7 @@
               chunkSize,
               hopSize,
               channels: resampled.channels,
-              numStems: 2,
+              numStems: stems,
             },
           });
         };

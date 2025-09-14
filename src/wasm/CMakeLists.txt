@@ -36,3 +36,12 @@ add_custom_command(
 add_custom_target(spleeter_wasm_module ALL
   DEPENDS ${SPLEETER_WASM_JS} ${SPLEETER_WASM_BIN}
 )
+
+# Copy artifacts to web/wasm for local serving
+set(WEB_WASM_DIR ${PROJECT_SOURCE_DIR}/web/wasm)
+add_custom_command(TARGET spleeter_wasm_module POST_BUILD
+  COMMAND ${CMAKE_COMMAND} -E make_directory ${WEB_WASM_DIR}
+  COMMAND ${CMAKE_COMMAND} -E copy_if_different ${SPLEETER_WASM_JS} ${WEB_WASM_DIR}/spleeter.js
+  COMMAND ${CMAKE_COMMAND} -E copy_if_different ${SPLEETER_WASM_BIN} ${WEB_WASM_DIR}/spleeter.wasm
+  COMMENT "Copying spleeter.js/.wasm to web/wasm"
+)
