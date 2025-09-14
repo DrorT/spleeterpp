@@ -117,6 +117,7 @@ self.onmessage = async (e) => {
           self._engines.set(numStems, engine);
         }
         const perStemOutputs = new Array(numStems).fill(null).map(() => []);
+        let errorOnce = false;
         for (let i = 0; i < chunks.length; i++) {
           if (cancelRequested) {
             self.postMessage({ type: "cancelled" });
@@ -125,7 +126,26 @@ self.onmessage = async (e) => {
           const c = chunks[i];
           // Slice channels per chunk
           const slice = channels.map((ch) => ch.subarray(c.start, c.end));
-          const result = await engine.runChunk(slice, sampleRate);
+          let result;
+          let t0, t1;
+          try {
+            t0 = performance.now();
+            result = await engine.runChunk(slice, sampleRate);
+            t1 = performance.now();
+          } catch (e) {
+            if (!errorOnce) {
+              self.postMessage({
+                type: "debug",
+                payload: {
+                  message: `[worker] runChunk failed: ${
+                    e && e.message ? e.message : e
+                  }`,
+                },
+              });
+              errorOnce = true;
+            }
+            throw e;
+          }
           for (let s = 0; s < numStems; s++)
             perStemOutputs[s].push(result.stems[s]);
           await new Promise((r) => setTimeout(r, 0));
@@ -136,6 +156,7 @@ self.onmessage = async (e) => {
               total: chunks.length,
               start: c.start,
               end: c.end,
+              durationMs: t1 - t0,
             },
           });
         }

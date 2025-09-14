@@ -70,7 +70,9 @@
           log(`Planned ${payload.total} chunks...`);
         } else if (type === "progress") {
           log(
-            `Chunk ${payload.index}/${payload.total} [${payload.start}, ${payload.end})`
+            `Chunk ${payload.index}/${payload.total} [${payload.start}, ${
+              payload.end
+            }) durationMs=${payload.durationMs.toFixed(2)}ms`
           );
         } else if (type === "cancelled") {
           cancelBtn.disabled = true;
