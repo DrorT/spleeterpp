@@ -43,13 +43,14 @@
           value="250"
           style="width: 70px"
       /></label>
-        <label style="margin-left: 12px">Precision:
-          <select id="precisionSelect">
-            <option value="auto" selected>auto</option>
-            <option value="low">low (F16)</option>
-            <option value="high">high (F32)</option>
-          </select>
-        </label>
+      <label style="margin-left: 12px"
+        >Precision:
+        <select id="precisionSelect">
+          <option value="auto" selected>auto</option>
+          <option value="low">low (F16)</option>
+          <option value="high">high (F32)</option>
+        </select>
+      </label>
     </div>
     <pre id="log">Loading...</pre>
     <script type="module">
@@ -329,7 +330,8 @@
           const stems = Number(stemsSelect.value);
           const progressIntervalMs =
             Number(document.getElementById("progressMs").value) || 250;
-            const precision = document.getElementById("precisionSelect").value || "auto";
+          const precision =
+            document.getElementById("precisionSelect").value || "auto";
           worker.postMessage({
             type: "process-audio",
             payload: {
@@ -340,7 +342,7 @@
               channels: resampled.channels,
               numStems: stems,
               progressIntervalMs,
-                precision,
+              precision,
             },
           });
         };
