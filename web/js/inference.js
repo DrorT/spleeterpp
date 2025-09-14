@@ -287,7 +287,7 @@ export class InferenceEngine {
       );
       this._loggedFirstInput = true;
     }
-    // Precompute STFT-based features using fast JS FFT (skip entirely on WebGL)
+    // Precompute STFT-based features using fast JS FFT (return raw arrays)
     const computeFeatures = async () => {
       const backend = tf.getBackend();
       if (backend === "webgl") {
@@ -300,7 +300,7 @@ export class InferenceEngine {
       const { channels: st, frames, bins } = stftStereo(prepped, 1024);
       let time = frames;
       if (!time || time <= 0) time = 1; // guard against tiny chunks
-      // Build real/imag tensors shaped [frames, bins(2049), 2]
+      // Build real/imag arrays shaped [frames, bins(2049), 2]
       const ch0 = st[0];
       const ch1 = st.length > 1 ? st[1] : st[0];
       const outBins = 2049; // bins
@@ -317,10 +317,7 @@ export class InferenceEngine {
           imagArr[dst + 1] = ch1?.imag?.[i0] ?? 0;
         }
       }
-      const realT = tf.tensor(realArr, [time, outBins, 2], "float32");
-      const imagT = tf.tensor(imagArr, [time, outBins, 2], "float32");
-      const stftStack = tf.complex(realT, imagT); // complex64 [frames,2049,2]
-      // Magnitude patch [1,512,1024,2]
+      // Magnitude patch arrays [time,1024,2] -> later [1,512,1024,2]
       const magArr = new Float32Array(time * 1024 * 2);
       for (let f = 0; f < time; f++) {
         const base = f * outBins;
@@ -337,28 +334,18 @@ export class InferenceEngine {
         }
       }
       const tSpan = Math.min(512, time);
-      const magT = tf.tensor(magArr, [time, 1024, 2], "float32");
-      const magSlice = magT.slice([0, 0, 0], [tSpan, 1024, 2]);
-      const pad = tSpan === 512 ? null : tf.zeros([512 - tSpan, 1024, 2]);
-      const magPatch = pad ? tf.concat([magSlice, pad], 0) : magSlice;
-      const mag4d = magPatch.expandDims(0);
-      // quick stats to ensure non-trivial features
-      try {
-        const minv = (await mag4d.min().data())[0];
-        const maxv = (await mag4d.max().data())[0];
-        const meanv = (await mag4d.mean().data())[0];
-        dbg(
-          "inference.js:features",
-          `mag4d stats: min=${minv.toFixed(4)} max=${maxv.toFixed(
-            4
-          )} mean=${meanv.toFixed(6)}`
-        );
-      } catch (_) {}
-      // Dispose temporaries we created
-      realT.dispose();
-      imagT.dispose();
-      magT.dispose();
-      if (pad) pad.dispose();
+      // JS stats only (no tensors yet)
+      let minv = Infinity,
+        maxv = -Infinity,
+        sum = 0,
+        cnt = 0;
+      for (let i = 0; i < magArr.length; i++) {
+        const v = magArr[i];
+        if (v < minv) minv = v;
+        if (v > maxv) maxv = v;
+        sum += v;
+        cnt++;
+      }
       const t1 = performance.now();
       dbg(
         "inference.js:features",
@@ -366,11 +353,18 @@ export class InferenceEngine {
       );
       dbg(
         "inference.js:features",
-        `done stft=${JSON.stringify(stftStack.shape)} mag4d=${JSON.stringify(
-          mag4d.shape
-        )}`
+        `done frames=${time} bins=${outBins} mag stats: min=${minv.toFixed(
+          4
+        )} max=${maxv.toFixed(4)} mean=${(sum / Math.max(1, cnt)).toFixed(6)}`
       );
-      return { stftStack, mag4d };
+      return {
+        time,
+        outBins,
+        tSpan,
+        stftReal: realArr,
+        stftImag: imagArr,
+        magArr,
+      };
     };
     let features = null;
     const tFeat0 =
@@ -416,7 +410,7 @@ export class InferenceEngine {
       `features total: ${(tFeat1 - tFeat0).toFixed(2)} ms`
     );
 
-    // Build minimal input dict: audio + any string placeholders (and known feature tensors when present)
+    // Build minimal input dict: audio + strings (defer feature tensors)
     const audioName = audioInputInfo?.name;
     const tMin0 =
       typeof performance !== "undefined" && performance.now
@@ -425,6 +419,8 @@ export class InferenceEngine {
     const minimalInputs = {};
     if (audioName) minimalInputs[audioName] = x;
     const stringInputsCreated = [];
+    const complexNames = [];
+    const mag4dNames = [];
     for (const info of inputsInfo) {
       if (!info?.name || info === audioInputInfo) continue;
       if (info.dtype === "string") {
@@ -433,25 +429,88 @@ export class InferenceEngine {
         tensorsToDispose.push(t);
         stringInputsCreated.push(info.name);
       } else if (matchesComplexInput(info)) {
-        if (features && features.stftStack) {
-          minimalInputs[info.name] = features.stftStack;
-          tensorsToDispose.push(features.stftStack);
-        } else {
+        if (features) complexNames.push(info.name);
+        else {
           const t = makeZeros(info.shape, info.dtype);
           minimalInputs[info.name] = t;
           tensorsToDispose.push(t);
         }
       } else if (matchesMag4dInput(info)) {
-        if (features && features.mag4d) {
-          minimalInputs[info.name] = features.mag4d;
-          tensorsToDispose.push(features.mag4d);
-        } else {
+        if (features) mag4dNames.push(info.name);
+        else {
           const t = makeZeros(info.shape, "float32");
           minimalInputs[info.name] = t;
           tensorsToDispose.push(t);
         }
       }
     }
+    // Helper: materialize feature tensors on the ACTIVE backend into a dict
+    const materializeFeaturesInto = (dict, complexList, magList) => {
+      if (!features) return;
+      let stftStack = null;
+      let mag4d = null;
+      // Dispose any previous tensors for these keys to avoid cross-backend reuse
+      if (complexList && complexList.length) {
+        const prev = new Set();
+        for (const name of complexList) {
+          const v = dict[name];
+          if (v && v.dispose) prev.add(v);
+        }
+        prev.forEach((t) => {
+          try {
+            t.dispose && t.dispose();
+          } catch (_) {}
+        });
+      }
+      if (magList && magList.length) {
+        const prev = new Set();
+        for (const name of magList) {
+          const v = dict[name];
+          if (v && v.dispose) prev.add(v);
+        }
+        prev.forEach((t) => {
+          try {
+            t.dispose && t.dispose();
+          } catch (_) {}
+        });
+      }
+      if (complexList && complexList.length) {
+        const realT = tf.tensor(
+          features.stftReal,
+          [features.time, 2049, 2],
+          "float32"
+        );
+        const imagT = tf.tensor(
+          features.stftImag,
+          [features.time, 2049, 2],
+          "float32"
+        );
+        stftStack = tf.complex(realT, imagT);
+        realT.dispose();
+        imagT.dispose();
+        tensorsToDispose.push(stftStack);
+        for (const name of complexList) dict[name] = stftStack;
+      }
+      if (magList && magList.length) {
+        const magT = tf.tensor(
+          features.magArr,
+          [features.time, 1024, 2],
+          "float32"
+        );
+        const magSlice = magT.slice([0, 0, 0], [features.tSpan, 1024, 2]);
+        const pad =
+          features.tSpan === 512
+            ? null
+            : tf.zeros([512 - features.tSpan, 1024, 2]);
+        const magPatch = pad ? tf.concat([magSlice, pad], 0) : magSlice;
+        mag4d = magPatch.expandDims(0);
+        magT.dispose();
+        magSlice.dispose();
+        if (pad) pad.dispose();
+        tensorsToDispose.push(mag4d);
+        for (const name of magList) dict[name] = mag4d;
+      }
+    };
     const tMin1 =
       typeof performance !== "undefined" && performance.now
         ? performance.now()
@@ -460,6 +519,8 @@ export class InferenceEngine {
       "inference.js:timing",
       `minimal inputs build: ${(tMin1 - tMin0).toFixed(2)} ms`
     );
+    const allComplexNames = [];
+    const allMag4dNames = [];
     const buildAllInputs = async () => {
       const dict = {};
       for (const info of inputsInfo) {
@@ -478,9 +539,8 @@ export class InferenceEngine {
           continue;
         }
         if (matchesComplexInput(info)) {
-          if (features && features.stftStack) {
-            dict[name] = features.stftStack;
-            tensorsToDispose.push(features.stftStack);
+          if (features && features.stftReal && features.stftImag) {
+            allComplexNames.push(name);
           } else {
             const t = makeZeros(shape, dtype);
             dict[name] = t;
@@ -489,9 +549,8 @@ export class InferenceEngine {
           continue;
         }
         if (matchesMag4dInput(info)) {
-          if (features && features.mag4d) {
-            dict[name] = features.mag4d;
-            tensorsToDispose.push(features.mag4d);
+          if (features && features.magArr) {
+            allMag4dNames.push(name);
           } else {
             const t = makeZeros(shape, "float32");
             dict[name] = t;
@@ -596,6 +655,10 @@ export class InferenceEngine {
         } catch (_) {}
         execBackend = prevBackend;
       }
+      // If we have deferred feature tensors to fill, materialize them now on the active backend
+      if (features && (complexNames.length || mag4dNames.length)) {
+        materializeFeaturesInto(minimalInputs, complexNames, mag4dNames);
+      }
       if (fetches && fetches.length) {
         dbg(
           "inference.js:exec",
@@ -621,6 +684,10 @@ export class InferenceEngine {
               await tf.setBackend("cpu");
               await tf.ready();
             } catch (_) {}
+            // Rebuild feature tensors on CPU backend if needed
+            if (features && (complexNames.length || mag4dNames.length)) {
+              materializeFeaturesInto(minimalInputs, complexNames, mag4dNames);
+            }
             const tRetry0 =
               typeof performance !== "undefined" && performance.now
                 ? performance.now()
@@ -649,6 +716,10 @@ export class InferenceEngine {
           "inference.js:exec",
           `execute minimal (backend=${tf.getBackend()})`
         );
+        // Materialize features if needed for minimal path
+        if (features && (complexNames.length || mag4dNames.length)) {
+          materializeFeaturesInto(minimalInputs, complexNames, mag4dNames);
+        }
         try {
           raw = this.model.executeAsync
             ? await this.model.executeAsync(minimalInputs)
@@ -667,6 +738,9 @@ export class InferenceEngine {
               await tf.setBackend("cpu");
               await tf.ready();
             } catch (_) {}
+            if (features && (complexNames.length || mag4dNames.length)) {
+              materializeFeaturesInto(minimalInputs, complexNames, mag4dNames);
+            }
             const tRetry0 =
               typeof performance !== "undefined" && performance.now
                 ? performance.now()
@@ -773,6 +847,10 @@ export class InferenceEngine {
         } catch (_) {}
         execBackend = prevBackend;
       }
+      // Materialize all-input features if needed on active backend
+      if (features && (allComplexNames.length || allMag4dNames.length)) {
+        materializeFeaturesInto(inputsDict, allComplexNames, allMag4dNames);
+      }
       if (fetches && fetches.length) {
         dbg(
           "inference.js:exec",
@@ -797,6 +875,14 @@ export class InferenceEngine {
               await tf.setBackend("cpu");
               await tf.ready();
             } catch (_) {}
+            // Rebuild feature tensors on CPU if needed
+            if (features && (allComplexNames.length || allMag4dNames.length)) {
+              materializeFeaturesInto(
+                inputsDict,
+                allComplexNames,
+                allMag4dNames
+              );
+            }
             const tRetry0 =
               typeof performance !== "undefined" && performance.now
                 ? performance.now()
@@ -822,6 +908,9 @@ export class InferenceEngine {
         }
       } else {
         dbg("inference.js:exec", `execute all (backend=${tf.getBackend()})`);
+        if (features && (allComplexNames.length || allMag4dNames.length)) {
+          materializeFeaturesInto(inputsDict, allComplexNames, allMag4dNames);
+        }
         try {
           raw = this.model.executeAsync
             ? await this.model.executeAsync(inputsDict)
@@ -838,6 +927,13 @@ export class InferenceEngine {
               await tf.setBackend("cpu");
               await tf.ready();
             } catch (_) {}
+            if (features && (allComplexNames.length || allMag4dNames.length)) {
+              materializeFeaturesInto(
+                inputsDict,
+                allComplexNames,
+                allMag4dNames
+              );
+            }
             const tRetry0 =
               typeof performance !== "undefined" && performance.now
                 ? performance.now()
@@ -1025,23 +1121,36 @@ export class InferenceEngine {
     };
 
     let stems;
-    if (numericOuts.length > 0) {
+    if (
+      (usedPath === "minimal+fetches" || usedPath === "all+fetches") &&
+      numericOuts.length === this.numStems
+    ) {
+      // We fetched one tensor per stem; assemble stems in order
+      const logs = [];
+      stems = new Array(this.numStems).fill(null).map((_, i) => {
+        const t = numericOuts[i];
+        const mono = toMonoFrom2D(t);
+        logs.push(
+          `out[${i}] ${t.dtype} ${JSON.stringify(t.shape)} rms=${stemRms(
+            mono
+          ).toFixed(6)}`
+        );
+        return mono;
+      });
+      if (!this._loggedFirstOutputs) {
+        dbg(
+          "inference.js:outputs",
+          `outputs (mapped per-stem): ${logs.join(" | ")}`
+        );
+        this._loggedFirstOutputs = true;
+      }
+    } else if (numericOuts.length > 0) {
+      // Fallback: choose the most informative output and parse into stems
       let best = { rms: -1, idx: -1, stems: null };
       const logs = [];
       for (let i = 0; i < numericOuts.length; i++) {
         const t = numericOuts[i];
-        // If we used fetch names and count equals stems, convert each to mono
-        let ss;
-        if (
-          (usedPath === "minimal+fetches" || usedPath === "all+fetches") &&
-          numericOuts.length === this.numStems
-        ) {
-          ss = new Array(this.numStems)
-            .fill(null)
-            .map((_, k) => (k === i ? toMonoFrom2D(t) : new Float32Array(T)));
-        } else {
-          ss = parseSingle(t);
-        }
+        const ss = parseSingle(t);
         const total = ss.reduce((acc, s) => acc + stemRms(s), 0);
         logs.push(
           `out[${i}] ${t.dtype} ${JSON.stringify(
@@ -1079,13 +1188,19 @@ export class InferenceEngine {
       typeof performance !== "undefined" && performance.now
         ? performance.now()
         : Date.now();
-    outs.forEach((t) => t && t.dispose && t.dispose());
+    outs.forEach((t) => {
+      try {
+        t && t.dispose && t.dispose();
+      } catch (_) {}
+    });
     const seen = new Set();
     tensorsToDispose.forEach((t) => {
       if (!t || !t.dispose) return;
       if (seen.has(t)) return;
       seen.add(t);
-      t.dispose();
+      try {
+        t.dispose();
+      } catch (_) {}
     });
     const tDisp1 =
       typeof performance !== "undefined" && performance.now
