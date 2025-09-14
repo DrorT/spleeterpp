@@ -20,7 +20,36 @@
       </select>
       <button id="loadModelBtn">Load Model</button>
       <button id="preloadAllBtn">Preload All</button>
-      <label style="margin-left:12px"><input type="checkbox" id="verboseChk" /> Verbose logs</label>
+      <label style="margin-left: 12px"
+        ><input type="checkbox" id="verboseChk" /> Verbose logs</label
+      >
+      <label style="margin-left: 12px"
+        >Chunk (s):
+        <input
+          id="chunkSec"
+          type="number"
+          min="2"
+          max="20"
+          value="10"
+          style="width: 60px"
+      /></label>
+      <label style="margin-left: 12px"
+        >Progress ms:
+        <input
+          id="progressMs"
+          type="number"
+          min="100"
+          max="2000"
+          value="250"
+          style="width: 70px"
+      /></label>
+        <label style="margin-left: 12px">Precision:
+          <select id="precisionSelect">
+            <option value="auto" selected>auto</option>
+            <option value="low">low (F16)</option>
+            <option value="high">high (F32)</option>
+          </select>
+        </label>
     </div>
     <pre id="log">Loading...</pre>
     <script type="module">
@@ -75,7 +104,8 @@
       setInterval(() => {
         const now = performance.now();
         const lag = now - lastTick - 1000;
-        if (lag > 50 && verboseChk.checked) log(`[ui] event-loop lag ~${lag.toFixed(1)}ms`);
+        if (lag > 50 && verboseChk.checked)
+          log(`[ui] event-loop lag ~${lag.toFixed(1)}ms`);
         lastTick = now;
       }, 1000);
 
@@ -87,7 +117,9 @@
         const p = pendingProgress;
         pendingProgress = null;
         log(
-          `Chunk ${p.index}/${p.total} [${p.start}, ${p.end}) durationMs=${p.durationMs.toFixed(2)}ms`
+          `Chunk ${p.index}/${p.total} [${p.start}, ${
+            p.end
+          }) durationMs=${p.durationMs.toFixed(2)}ms`
         );
         progressRAF = false;
       };
@@ -290,9 +322,14 @@
             );
           }
           const frames = resampled.channels?.[0]?.length || 0;
-          const chunkSize = 44100 * 10; // 10s chunk
-          const hopSize = 44100 * 5; // 50% overlap
+          const chunkSec =
+            Number(document.getElementById("chunkSec").value) || 10;
+          const chunkSize = Math.max(1, Math.floor(44100 * chunkSec));
+          const hopSize = Math.floor(chunkSize / 2); // 50% overlap
           const stems = Number(stemsSelect.value);
+          const progressIntervalMs =
+            Number(document.getElementById("progressMs").value) || 250;
+            const precision = document.getElementById("precisionSelect").value || "auto";
           worker.postMessage({
             type: "process-audio",
             payload: {
@@ -302,6 +339,8 @@
               hopSize,
               channels: resampled.channels,
               numStems: stems,
+              progressIntervalMs,
+                precision,
             },
           });
         };

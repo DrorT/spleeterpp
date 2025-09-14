@@ -1,5 +1,5 @@
 // Inference adapter for TF.js models (model loading + inference)
-import { ensureTF, configureBackend } from "./tf-backend.js";
+import { ensureTF, configureBackend, applyWebGLTuning } from "./tf-backend.js";
 import { loadGraphModelWithCache } from "./model-loader.js";
 import { stftStereo } from "./fft4096.js";
 
@@ -71,8 +71,9 @@ export class InferenceEngine {
     return { url: this.modelUrl, io: this.io, numStems: this.numStems };
   }
 
-  async runChunk(channelsOrMono, sampleRate) {
+  async runChunk(channelsOrMono, sampleRate, opts = {}) {
     const tf = await ensureTF();
+    const precision = opts?.precision || "auto";
     const tAll0 =
       typeof performance !== "undefined" && performance.now
         ? performance.now()
@@ -614,6 +615,11 @@ export class InferenceEngine {
       let triedWebGL = false;
       let execBackend = tf.getBackend();
       const prevBackend = execBackend;
+      // Apply precision tuning if requested
+      try {
+        if (precision === "low") await applyWebGLTuning({ precision: "low" });
+        if (precision === "high") await applyWebGLTuning({ precision: "high" });
+      } catch (_) {}
       // Try switch to WebGL just for model execution
       try {
         if (prevBackend !== "webgl") {

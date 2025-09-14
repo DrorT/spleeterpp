@@ -16,7 +16,10 @@ self.onmessage = async (e) => {
   switch (type) {
     case "set-verbose": {
       verbose = !!payload?.verbose;
-      self.postMessage({ type: "debug", payload: { message: `[worker] verbose=${verbose}` } });
+      self.postMessage({
+        type: "debug",
+        payload: { message: `[worker] verbose=${verbose}` },
+      });
       return;
     }
     case "load-model": {
@@ -102,6 +105,7 @@ self.onmessage = async (e) => {
           hopSize,
           channels,
           numStems = 2,
+          precision = "auto",
         } = payload;
         const tMsg0 = performance.now();
         self.postMessage({
@@ -109,7 +113,15 @@ self.onmessage = async (e) => {
           payload: { frames, chunkSize, hopSize, numStems },
         });
         const tMsg1 = performance.now();
-  if (verbose) self.postMessage({ type: "debug", payload: { message: `[worker] post processing-start took ${(tMsg1-tMsg0).toFixed(2)}ms` } });
+        if (verbose)
+          self.postMessage({
+            type: "debug",
+            payload: {
+              message: `[worker] post processing-start took ${(
+                tMsg1 - tMsg0
+              ).toFixed(2)}ms`,
+            },
+          });
         const chunks = planChunks(frames, chunkSize, hopSize);
         const tPlan0 = performance.now();
         self.postMessage({
@@ -117,7 +129,15 @@ self.onmessage = async (e) => {
           payload: { total: chunks.length },
         });
         const tPlan1 = performance.now();
-  if (verbose) self.postMessage({ type: "debug", payload: { message: `[worker] post planned took ${(tPlan1-tPlan0).toFixed(2)}ms` } });
+        if (verbose)
+          self.postMessage({
+            type: "debug",
+            payload: {
+              message: `[worker] post planned took ${(tPlan1 - tPlan0).toFixed(
+                2
+              )}ms`,
+            },
+          });
         // Use cached engine if available or create fresh
         self._engines = self._engines || new Map();
         let engine = self._engines.get(numStems);
@@ -127,6 +147,11 @@ self.onmessage = async (e) => {
           self._engines.set(numStems, engine);
         }
         const perStemOutputs = new Array(numStems).fill(null).map(() => []);
+        const progressIntervalMs = Math.max(
+          50,
+          Number(payload?.progressIntervalMs || 250)
+        );
+        let lastProgressTime = 0;
         let errorOnce = false;
         for (let i = 0; i < chunks.length; i++) {
           if (cancelRequested) {
@@ -140,7 +165,7 @@ self.onmessage = async (e) => {
           let t0, t1;
           try {
             t0 = performance.now();
-            result = await engine.runChunk(slice, sampleRate);
+            result = await engine.runChunk(slice, sampleRate, { precision });
             t1 = performance.now();
           } catch (e) {
             if (!errorOnce) {
@@ -161,19 +186,34 @@ self.onmessage = async (e) => {
             perStemOutputs[s].push(result.stems[s]);
           // Let UI breathe once per chunk boundary
           await new Promise((r) => setTimeout(r, 0));
-          const tProg0 = performance.now();
-          self.postMessage({
-            type: "progress",
-            payload: {
-              index: i + 1,
-              total: chunks.length,
-              start: c.start,
-              end: c.end,
-              durationMs: t1 - t0,
-            },
-          });
-          const tProg1 = performance.now();
-          if (verbose) self.postMessage({ type: "debug", payload: { message: `[worker] post progress ${i+1}/${chunks.length} took ${(tProg1-tProg0).toFixed(2)}ms` } });
+          const now = performance.now();
+          if (
+            now - lastProgressTime >= progressIntervalMs ||
+            i === chunks.length - 1
+          ) {
+            const tProg0 = now;
+            self.postMessage({
+              type: "progress",
+              payload: {
+                index: i + 1,
+                total: chunks.length,
+                start: c.start,
+                end: c.end,
+                durationMs: t1 - t0,
+              },
+            });
+            const tProg1 = performance.now();
+            if (verbose)
+              self.postMessage({
+                type: "debug",
+                payload: {
+                  message: `[worker] post progress ${i + 1}/${
+                    chunks.length
+                  } took ${(tProg1 - tProg0).toFixed(2)}ms`,
+                },
+              });
+            lastProgressTime = now;
+          }
         }
         // Stitch per-stem results (mono only for now)
         const stitched = perStemOutputs.map((chunks) =>
@@ -211,7 +251,15 @@ self.onmessage = async (e) => {
           transfer
         );
         const tDone1 = performance.now();
-  if (verbose) self.postMessage({ type: "debug", payload: { message: `[worker] post done took ${(tDone1-tDone0).toFixed(2)}ms` } });
+        if (verbose)
+          self.postMessage({
+            type: "debug",
+            payload: {
+              message: `[worker] post done took ${(tDone1 - tDone0).toFixed(
+                2
+              )}ms`,
+            },
+          });
       } catch (err) {
         self.postMessage({
           type: "error",
