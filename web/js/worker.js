@@ -4,17 +4,21 @@ import { planChunks, overlapAddStitchMono } from "./chunking.js";
 import { InferenceEngine } from "./inference.js";
 
 let cancelRequested = false;
+let verbose = false;
 
 // Signal readiness as soon as the module loads
 self.postMessage({ type: "worker-ready" });
 
 self.onmessage = async (e) => {
   const { type, payload } = e.data || {};
-  self.postMessage({
-    type: "debug",
-    payload: { message: `Worker received message: ${type}` },
-  });
+  // Keep initial debug minimal; verbose logs are filtered in UI
+  // self.postMessage({ type: "debug", payload: { message: `Worker received message: ${type}` } });
   switch (type) {
+    case "set-verbose": {
+      verbose = !!payload?.verbose;
+      self.postMessage({ type: "debug", payload: { message: `[worker] verbose=${verbose}` } });
+      return;
+    }
     case "load-model": {
       try {
         const stems = Number(payload?.stems || 2);
@@ -99,15 +103,21 @@ self.onmessage = async (e) => {
           channels,
           numStems = 2,
         } = payload;
+        const tMsg0 = performance.now();
         self.postMessage({
           type: "processing-start",
           payload: { frames, chunkSize, hopSize, numStems },
         });
+        const tMsg1 = performance.now();
+  if (verbose) self.postMessage({ type: "debug", payload: { message: `[worker] post processing-start took ${(tMsg1-tMsg0).toFixed(2)}ms` } });
         const chunks = planChunks(frames, chunkSize, hopSize);
+        const tPlan0 = performance.now();
         self.postMessage({
           type: "planned",
           payload: { total: chunks.length },
         });
+        const tPlan1 = performance.now();
+  if (verbose) self.postMessage({ type: "debug", payload: { message: `[worker] post planned took ${(tPlan1-tPlan0).toFixed(2)}ms` } });
         // Use cached engine if available or create fresh
         self._engines = self._engines || new Map();
         let engine = self._engines.get(numStems);
@@ -134,21 +144,24 @@ self.onmessage = async (e) => {
             t1 = performance.now();
           } catch (e) {
             if (!errorOnce) {
-              self.postMessage({
-                type: "debug",
-                payload: {
-                  message: `[worker] runChunk failed: ${
-                    e && e.message ? e.message : e
-                  }`,
-                },
-              });
+              if (verbose)
+                self.postMessage({
+                  type: "debug",
+                  payload: {
+                    message: `[worker] runChunk failed: ${
+                      e && e.message ? e.message : e
+                    }`,
+                  },
+                });
               errorOnce = true;
             }
             throw e;
           }
           for (let s = 0; s < numStems; s++)
             perStemOutputs[s].push(result.stems[s]);
+          // Let UI breathe once per chunk boundary
           await new Promise((r) => setTimeout(r, 0));
+          const tProg0 = performance.now();
           self.postMessage({
             type: "progress",
             payload: {
@@ -159,6 +172,8 @@ self.onmessage = async (e) => {
               durationMs: t1 - t0,
             },
           });
+          const tProg1 = performance.now();
+          if (verbose) self.postMessage({ type: "debug", payload: { message: `[worker] post progress ${i+1}/${chunks.length} took ${(tProg1-tProg0).toFixed(2)}ms` } });
         }
         // Stitch per-stem results (mono only for now)
         const stitched = perStemOutputs.map((chunks) =>
@@ -186,10 +201,17 @@ self.onmessage = async (e) => {
           return { len: n, min, max, rms, nzFrac };
         };
         const stats = stitched.map((a) => computeStats(a));
-        self.postMessage({
-          type: "done",
-          payload: { stems: stitched, sampleRate, stats },
-        });
+        const tDone0 = performance.now();
+        const transfer = stitched.map((a) => a.buffer);
+        self.postMessage(
+          {
+            type: "done",
+            payload: { stems: stitched, sampleRate, stats },
+          },
+          transfer
+        );
+        const tDone1 = performance.now();
+  if (verbose) self.postMessage({ type: "debug", payload: { message: `[worker] post done took ${(tDone1-tDone0).toFixed(2)}ms` } });
       } catch (err) {
         self.postMessage({
           type: "error",

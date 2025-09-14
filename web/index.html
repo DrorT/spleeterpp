@@ -20,6 +20,7 @@
       </select>
       <button id="loadModelBtn">Load Model</button>
       <button id="preloadAllBtn">Preload All</button>
+      <label style="margin-left:12px"><input type="checkbox" id="verboseChk" /> Verbose logs</label>
     </div>
     <pre id="log">Loading...</pre>
     <script type="module">
@@ -27,7 +28,29 @@
       import { resampleTo44100, decodeArrayBufferToPCM } from "./js/audio.js";
 
       const logEl = document.getElementById("log");
-      const log = (m) => (logEl.textContent += `\n${m}`);
+      const verboseChk = document.getElementById("verboseChk");
+      // Throttled logger with line cap to reduce reflow jank
+      const MAX_LINES = 400;
+      let logLines = ["Loading..."]; // initialize with existing content
+      let logBuffer = [];
+      let rafScheduled = false;
+      const flushLogs = () => {
+        if (logBuffer.length) {
+          for (const m of logBuffer) logLines.push(m);
+          if (logLines.length > MAX_LINES)
+            logLines = logLines.slice(logLines.length - MAX_LINES);
+          logEl.textContent = logLines.join("\n");
+          logBuffer.length = 0;
+        }
+        rafScheduled = false;
+      };
+      const log = (m) => {
+        logBuffer.push(m);
+        if (!rafScheduled) {
+          rafScheduled = true;
+          requestAnimationFrame(flushLogs);
+        }
+      };
       const fileInput = document.getElementById("fileInput");
       const cancelBtn = document.getElementById("cancelBtn");
       const stemsSelect = document.getElementById("stemsSelect");
@@ -47,6 +70,28 @@
         log("Worker messageerror: " + String(ev?.data ?? ""));
         console.error("Worker messageerror", ev);
       });
+      // Simple event-loop lag monitor
+      let lastTick = performance.now();
+      setInterval(() => {
+        const now = performance.now();
+        const lag = now - lastTick - 1000;
+        if (lag > 50 && verboseChk.checked) log(`[ui] event-loop lag ~${lag.toFixed(1)}ms`);
+        lastTick = now;
+      }, 1000);
+
+      // Batch progress updates to reduce UI churn
+      let pendingProgress = null;
+      let progressRAF = false;
+      const flushProgress = () => {
+        if (!pendingProgress) return;
+        const p = pendingProgress;
+        pendingProgress = null;
+        log(
+          `Chunk ${p.index}/${p.total} [${p.start}, ${p.end}) durationMs=${p.durationMs.toFixed(2)}ms`
+        );
+        progressRAF = false;
+      };
+
       worker.onmessage = async (e) => {
         const { type, payload } = e.data || {};
         if (type === "worker-ready") {
@@ -54,7 +99,8 @@
           return;
         }
         if (type === "debug") {
-          if (payload?.message) log(`[worker] ${payload.message}`);
+          if (verboseChk.checked && payload?.message)
+            log(`[worker] ${payload.message}`);
           return;
         }
         if (type === "model-loading") {
@@ -69,11 +115,11 @@
           cancelBtn.disabled = false;
           log(`Planned ${payload.total} chunks...`);
         } else if (type === "progress") {
-          log(
-            `Chunk ${payload.index}/${payload.total} [${payload.start}, ${
-              payload.end
-            }) durationMs=${payload.durationMs.toFixed(2)}ms`
-          );
+          pendingProgress = payload;
+          if (!progressRAF) {
+            progressRAF = true;
+            requestAnimationFrame(flushProgress);
+          }
         } else if (type === "cancelled") {
           cancelBtn.disabled = true;
           log("Cancelled");
@@ -171,6 +217,13 @@
           type: "preload-all-models",
           payload: { stemsList: [2, 4, 5] },
         });
+      };
+
+      // Verbose toggle: inform worker to enable/disable debug messages
+      verboseChk.onchange = () => {
+        const verbose = !!verboseChk.checked;
+        worker.postMessage({ type: "set-verbose", payload: { verbose } });
+        log(`[ui] verbose=${verbose}`);
       };
 
       cancelBtn.onclick = () => worker.postMessage({ type: "cancel" });
