@@ -7,6 +7,13 @@ import { configureBackend } from "./tf-backend.js";
 let cancelRequested = false;
 let verbose = false;
 let preferredBackend = "auto"; // 'auto' or 'cpu'
+// Tiling settings (defaults). Can be overridden via messages or per-request.
+let tilingSettings = {
+  tileBatch: 3, // tiles per batched runChunks inside tiling
+  prefetchDepth: 2, // future groups to precompute
+  stitchWindow: "hann", // 'hann' | 'tri'
+  overlapFraction: 0.5, // fraction of window shared between adjacent tiles [0, <1)
+};
 
 // Signal readiness as soon as the module loads
 self.postMessage({ type: "worker-ready" });
@@ -38,6 +45,10 @@ self.onmessage = async (e) => {
         const stems = Number(payload?.stems || 2);
         const sampleRate = Number(payload?.sampleRate || 44100);
         const chunkSize = Number(payload?.chunkSize || 44100 * 10);
+        const settings = {
+          ...tilingSettings,
+          ...(payload?.tilingSettings || {}),
+        };
         self._engines = self._engines || new Map();
         const engine = self._engines.get(stems);
         let framesSpan = 512;
@@ -56,7 +67,14 @@ self.onmessage = async (e) => {
         } catch (_) {}
         const hopSamples = 1024;
         const windowSamples = framesSpan * hopSamples;
-        const hopTile = Math.floor(windowSamples / 2);
+        const overlapFrac = Math.max(
+          0,
+          Math.min(0.99, Number(settings.overlapFraction) || 0.5)
+        );
+        const hopTile = Math.max(
+          1,
+          Math.floor(windowSamples * (1 - overlapFrac))
+        );
         const tilesForChunk =
           chunkSize <= windowSamples
             ? 1
@@ -70,7 +88,8 @@ self.onmessage = async (e) => {
             windowSeconds: windowSamples / sampleRate,
             chunkSize,
             tilesForChunk,
-            overlap: 0.5,
+            overlap: overlapFrac,
+            settings,
           },
         });
       } catch (err) {
@@ -79,6 +98,40 @@ self.onmessage = async (e) => {
           payload: makeErrorPayload(err, "query-tiling"),
         });
       }
+      return;
+    }
+    case "set-tiling-settings": {
+      try {
+        if (payload && typeof payload === "object") {
+          const t = Number(payload.tileBatch);
+          const p = Number(payload.prefetchDepth);
+          const w = String(payload.stitchWindow || tilingSettings.stitchWindow);
+          const o = Number(payload.overlapFraction);
+          if (Number.isFinite(t) && t >= 1 && t <= 16)
+            tilingSettings.tileBatch = Math.floor(t);
+          if (Number.isFinite(p) && p >= 1 && p <= 16)
+            tilingSettings.prefetchDepth = Math.floor(p);
+          if (w === "hann" || w === "tri") tilingSettings.stitchWindow = w;
+          if (Number.isFinite(o))
+            tilingSettings.overlapFraction = Math.max(0, Math.min(0.99, o));
+        }
+        self.postMessage({
+          type: "tiling-settings-set",
+          payload: { ...tilingSettings },
+        });
+      } catch (err) {
+        self.postMessage({
+          type: "error",
+          payload: makeErrorPayload(err, "set-tiling-settings"),
+        });
+      }
+      return;
+    }
+    case "get-tiling-settings": {
+      self.postMessage({
+        type: "tiling-settings",
+        payload: { ...tilingSettings },
+      });
       return;
     }
     case "set-backend": {
@@ -231,6 +284,14 @@ self.onmessage = async (e) => {
           self._engines.set(numStems, engine);
         }
         const perStemOutputs = new Array(numStems).fill(null).map(() => []);
+        // Effective tiling settings for this request (allow per-request override)
+        const effSettings = {
+          ...tilingSettings,
+          ...(payload?.tilingSettings &&
+          typeof payload.tilingSettings === "object"
+            ? payload.tilingSettings
+            : {}),
+        };
         let lastBackend = null;
         const progressIntervalMs = Math.max(
           50,
@@ -337,7 +398,6 @@ self.onmessage = async (e) => {
         // Precompute features for upcoming groups (prefetch depth)
         let nextFeaturesB = null;
         let firstBatchLogged = false;
-        const PREFETCH_DEPTH = 2;
         // Determine dynamic receptive field in samples (framesSpan * hopSamples)
         const getFramesSpan = () => {
           try {
@@ -357,7 +417,14 @@ self.onmessage = async (e) => {
         const MAX_WIN_SAMPLES = FRAMES_SPAN * STFT_HOP_SAMPLES;
         // Inform UI about computed receptive window and expected tiling for this chunk size
         try {
-          const hopSamplesTile = Math.floor(MAX_WIN_SAMPLES / 2);
+          const overlapFrac = Math.max(
+            0,
+            Math.min(0.99, Number(effSettings.overlapFraction) || 0.5)
+          );
+          const hopSamplesTile = Math.max(
+            1,
+            Math.floor(MAX_WIN_SAMPLES * (1 - overlapFrac))
+          );
           const tilesForChunk =
             chunkSize <= MAX_WIN_SAMPLES
               ? 1
@@ -371,19 +438,27 @@ self.onmessage = async (e) => {
               windowSeconds: MAX_WIN_SAMPLES / sampleRate,
               chunkSize,
               tilesForChunk,
-              overlap: 0.5,
+              overlap: overlapFrac,
+              settings: { ...effSettings },
             },
           });
         } catch (_) {}
         // Helper: run a slice through engine, internally tiling if too long
         const runTiledMono = async (slice, sampleRate, opts) => {
+          const S = (opts && opts.settings) || effSettings;
+          const tag = opts?.tag;
+          const tTotal0 = performance.now();
           const T = slice && slice[0] ? slice[0].length : 0;
           if (T <= 0)
             return { stems: new Array(numStems).fill(new Float32Array(0)) };
           // Dynamic receptive window length in samples
           const maxWin = MAX_WIN_SAMPLES;
           if (T <= maxWin) return engine.runChunk(slice, sampleRate, opts);
-          const hop = Math.floor(maxWin / 2);
+          const overlapFrac = Math.max(
+            0,
+            Math.min(0.99, Number(S.overlapFraction) || 0.5)
+          );
+          const hop = Math.max(1, Math.floor(maxWin * (1 - overlapFrac)));
           const parts = [];
           for (let s = 0; s < T; s += hop) {
             const start = s;
@@ -393,19 +468,26 @@ self.onmessage = async (e) => {
           }
           // Batch the sub-tiles where possible
           let partials = [];
+          let tileComputeMs = 0;
           try {
             // Batch tiles in smaller groups to reduce memory pressure
-            const TILE_BATCH = 3;
+            const TILE_BATCH = Math.max(
+              1,
+              Math.floor(Number(S.tileBatch) || 1)
+            );
             const stemsB_all = [];
             for (let i = 0; i < parts.length; i += TILE_BATCH) {
               const group = parts.slice(i, i + TILE_BATCH);
               const subSlicesB = group.map((p) =>
                 slice.map((ch) => ch.subarray(p.start, p.end))
               );
+              const tG0 = performance.now();
               const batched = await engine.runChunks(subSlicesB, sampleRate, {
                 stickyBackend: !!opts?.stickyBackend,
                 forceCpu: !!opts?.forceCpu,
               });
+              const tG1 = performance.now();
+              tileComputeMs += tG1 - tG0;
               const stemsB = batched && batched.stemsB ? batched.stemsB : [];
               if (!stemsB.length) throw new Error("empty batched result");
               stemsB_all.push(...stemsB);
@@ -416,7 +498,10 @@ self.onmessage = async (e) => {
             partials = [];
             for (const p of parts) {
               const sub = slice.map((ch) => ch.subarray(p.start, p.end));
+              const tS0 = performance.now();
               const r = await engine.runChunk(sub, sampleRate, opts);
+              const tS1 = performance.now();
+              tileComputeMs += tS1 - tS0;
               partials.push(r.stems);
             }
           }
@@ -425,6 +510,16 @@ self.onmessage = async (e) => {
             .fill(null)
             .map(() => new Float32Array(T));
           const weight = new Float32Array(T);
+          const tri = (n) => {
+            const w = new Float32Array(n);
+            if (n === 1) {
+              w[0] = 1;
+              return w;
+            }
+            for (let i = 0; i < n; i++)
+              w[i] = 1 - Math.abs((2 * i) / (n - 1) - 1);
+            return w;
+          };
           const hann = (n) => {
             const w = new Float32Array(n);
             if (n === 1) {
@@ -435,10 +530,13 @@ self.onmessage = async (e) => {
               w[i] = 0.5 * (1 - Math.cos((2 * Math.PI * i) / (n - 1)));
             return w;
           };
+          const makeWindow = (n) =>
+            S.stitchWindow === "tri" ? tri(n) : hann(n);
+          const tStitch0 = performance.now();
           for (let pi = 0; pi < parts.length; pi++) {
             const p = parts[pi];
             const len = p.end - p.start;
-            const wv = hann(len);
+            const wv = makeWindow(len);
             for (let s = 0; s < numStems; s++) {
               const src = partials[pi][s];
               for (let t = 0; t < len; t++) {
@@ -452,6 +550,24 @@ self.onmessage = async (e) => {
           for (let t = 0; t < T; t++) {
             const w = weight[t] > 1e-6 ? 1 / weight[t] : 1;
             for (let s = 0; s < numStems; s++) out[s][t] *= w;
+          }
+          const tStitch1 = performance.now();
+          const tTotal1 = performance.now();
+          if (verbose) {
+            self.postMessage({
+              type: "tiling-timing",
+              payload: {
+                tag,
+                samples: T,
+                tiles: parts.length,
+                tileBatch: Math.max(1, Math.floor(Number(S.tileBatch) || 1)),
+                stitchWindow: S.stitchWindow,
+                overlapFraction: Number(S.overlapFraction) || 0.5,
+                tileComputeMs: tileComputeMs,
+                stitchMs: tStitch1 - tStitch0,
+                totalMs: tTotal1 - tTotal0,
+              },
+            });
           }
           return { stems: out };
         };
@@ -469,7 +585,16 @@ self.onmessage = async (e) => {
             // Kick off precompute for the next group early
             const nextGroup = chunks.slice(
               i + group.length,
-              Math.min(chunks.length, i + group.length + bs * PREFETCH_DEPTH)
+              Math.min(
+                chunks.length,
+                i +
+                  group.length +
+                  bs *
+                    Math.max(
+                      1,
+                      Math.floor(Number(effSettings.prefetchDepth) || 1)
+                    )
+              )
             );
             const nextSlicesB = nextGroup.map((c) =>
               channels.map((ch) => ch.subarray(c.start, c.end))
@@ -491,6 +616,8 @@ self.onmessage = async (e) => {
                   const r = await runTiledMono(slicesB[j], sampleRate, {
                     stickyBackend: true,
                     forceCpu: preferredBackend === "cpu",
+                    settings: effSettings,
+                    tag: reqTag,
                   });
                   stemsB.push(r.stems);
                 }
@@ -606,6 +733,8 @@ self.onmessage = async (e) => {
               stickyBackend: true,
               forceCpu: preferredBackend === "cpu",
               features: nextFeaturesB || (await nextFeatPromise),
+              settings: effSettings,
+              tag: reqTag,
             });
             const t1 = performance.now();
             nextFeaturesB = null;

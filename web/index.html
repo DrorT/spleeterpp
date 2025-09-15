@@ -75,6 +75,54 @@
         "
       >
         <label
+          >Overlap %:
+          <input
+            id="overlapPct"
+            type="number"
+            min="0"
+            max="90"
+            value="50"
+            style="width: 60px"
+          />
+        </label>
+        <label style="margin-left: 8px"
+          >Stitch:
+          <select id="stitchWindow" style="width: 80px">
+            <option value="hann" selected>Hann</option>
+            <option value="tri">Tri</option>
+          </select>
+        </label>
+        <label style="margin-left: 8px"
+          >Tile batch:
+          <input
+            id="tileBatch"
+            type="number"
+            min="1"
+            max="8"
+            value="3"
+            style="width: 60px"
+          />
+        </label>
+        <label style="margin-left: 8px"
+          >Prefetch:
+          <input
+            id="prefetchDepth"
+            type="number"
+            min="1"
+            max="8"
+            value="2"
+            style="width: 60px"
+          />
+        </label>
+      </span>
+      <span
+        style="
+          margin-left: 12px;
+          border-left: 1px solid #ccc;
+          padding-left: 12px;
+        "
+      >
+        <label
           >A/B chunks (s):
           <input
             id="abA"
@@ -178,6 +226,32 @@
         log("Worker messageerror: " + String(ev?.data ?? ""));
         console.error("Worker messageerror", ev);
       });
+      // Tiling settings helpers and query
+      const getTilingSettingsFromUI = () => {
+        const overlapPctEl = document.getElementById("overlapPct");
+        const stitchEl = document.getElementById("stitchWindow");
+        const tileBatchEl = document.getElementById("tileBatch");
+        const prefetchEl = document.getElementById("prefetchDepth");
+        const overlapPct = Math.max(
+          0,
+          Math.min(99, Number(overlapPctEl?.value) || 50)
+        );
+        const overlapFraction = overlapPct / 100;
+        const stitchWindow = stitchEl?.value || "hann";
+        const tileBatch = Math.max(
+          1,
+          Math.min(8, Number(tileBatchEl?.value) || 3)
+        );
+        const prefetchDepth = Math.max(
+          1,
+          Math.min(8, Number(prefetchEl?.value) || 2)
+        );
+        return { overlapFraction, stitchWindow, tileBatch, prefetchDepth };
+      };
+      const pushTilingSettings = () => {
+        const s = getTilingSettingsFromUI();
+        worker.postMessage({ type: "set-tiling-settings", payload: s });
+      };
       // Query tiling info helper
       const queryTiling = () => {
         const stems = Number(stemsSelect.value) || 2;
@@ -187,7 +261,12 @@
         );
         worker.postMessage({
           type: "query-tiling",
-          payload: { stems, sampleRate: 44100, chunkSize },
+          payload: {
+            stems,
+            sampleRate: 44100,
+            chunkSize,
+            tilingSettings: getTilingSettingsFromUI(),
+          },
         });
       };
       // Backend control
@@ -357,7 +436,14 @@
           const p = payload || {};
           const secs = (p.windowSeconds || 0).toFixed(2);
           const tiles = p.tilesForChunk || 1;
-          const info = `Window: ${p.windowSamples} samples (~${secs}s) [${p.framesSpan}×${p.hopSamples}], tiles for chunk: ${tiles}`;
+          const ov =
+            p.overlap != null
+              ? `, overlap=${Math.round(p.overlap * 100)}%`
+              : "";
+          const tb = p.settings?.tileBatch
+            ? `, tileBatch=${p.settings.tileBatch}`
+            : "";
+          const info = `Window: ${p.windowSamples} samples (~${secs}s) [${p.framesSpan}×${p.hopSamples}], tiles for chunk: ${tiles}${ov}${tb}`;
           const wi = document.getElementById("windowInfo");
           if (wi) wi.textContent = info;
           log(info);
@@ -635,9 +721,11 @@
         const send = (tag, chunkSec) => {
           const chunkSize = Math.max(1, Math.floor(44100 * chunkSec));
           const alignHop = !!document.getElementById("abAlignHop").checked;
-          const hopSize = alignHop
-            ? Math.floor((44100 * Math.min(abA, abB)) / 2)
-            : Math.floor(chunkSize / 2);
+          const ov = getTilingSettingsFromUI().overlapFraction;
+          const baseHop = alignHop
+            ? Math.floor(44100 * Math.min(abA, abB))
+            : chunkSize;
+          const hopSize = Math.max(1, Math.floor(baseHop * (1 - ov)));
           worker.postMessage({
             type: "process-audio",
             payload: {
@@ -650,6 +738,7 @@
               numStems: stems,
               progressIntervalMs,
               batchSize,
+              tilingSettings: getTilingSettingsFromUI(),
             },
           });
         };
@@ -662,8 +751,36 @@
         const stems = Number(stemsSelect.value);
         worker.postMessage({ type: "load-model", payload: { stems } });
       };
-      stemsSelect.onchange = () => queryTiling();
-      chunkSecInput.onchange = () => queryTiling();
+      stemsSelect.onchange = () => {
+        pushTilingSettings();
+        queryTiling();
+      };
+      chunkSecInput.onchange = () => {
+        pushTilingSettings();
+        queryTiling();
+      };
+      const overlapPctEl = document.getElementById("overlapPct");
+      if (overlapPctEl)
+        overlapPctEl.onchange = () => {
+          pushTilingSettings();
+          queryTiling();
+        };
+      const stitchEl = document.getElementById("stitchWindow");
+      if (stitchEl)
+        stitchEl.onchange = () => {
+          pushTilingSettings();
+          queryTiling();
+        };
+      const tileBatchEl = document.getElementById("tileBatch");
+      if (tileBatchEl)
+        tileBatchEl.onchange = () => {
+          pushTilingSettings();
+        };
+      const prefetchEl = document.getElementById("prefetchDepth");
+      if (prefetchEl)
+        prefetchEl.onchange = () => {
+          pushTilingSettings();
+        };
       setIdealBtn.onclick = () => {
         const wi = document.getElementById("windowInfo");
         const text = wi?.textContent || "";
@@ -782,7 +899,8 @@
           const chunkSec =
             Number(document.getElementById("chunkSec").value) || 10;
           const chunkSize = Math.max(1, Math.floor(44100 * chunkSec));
-          const hopSize = Math.floor(chunkSize / 2);
+          const ov = getTilingSettingsFromUI().overlapFraction;
+          const hopSize = Math.max(1, Math.floor(chunkSize * (1 - ov)));
           const stems = Number(stemsSelect.value);
           const progressIntervalMs =
             Number(document.getElementById("progressMs").value) || 250;
@@ -798,6 +916,7 @@
               numStems: stems,
               progressIntervalMs,
               batchSize,
+              tilingSettings: getTilingSettingsFromUI(),
             },
           });
         };
