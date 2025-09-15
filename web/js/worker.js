@@ -33,6 +33,54 @@ self.onmessage = async (e) => {
   // Keep initial debug minimal; verbose logs are filtered in UI
   // self.postMessage({ type: "debug", payload: { message: `Worker received message: ${type}` } });
   switch (type) {
+    case "query-tiling": {
+      try {
+        const stems = Number(payload?.stems || 2);
+        const sampleRate = Number(payload?.sampleRate || 44100);
+        const chunkSize = Number(payload?.chunkSize || 44100 * 10);
+        self._engines = self._engines || new Map();
+        const engine = self._engines.get(stems);
+        let framesSpan = 512;
+        try {
+          const ins = (engine && engine.model && engine.model.inputs) || [];
+          for (const info of ins) {
+            const sh = info && info.shape;
+            if (Array.isArray(sh) && sh.length === 4) {
+              const tDim = sh[1];
+              if (typeof tDim === "number" && tDim > 0) {
+                framesSpan = tDim;
+                break;
+              }
+            }
+          }
+        } catch (_) {}
+        const hopSamples = 1024;
+        const windowSamples = framesSpan * hopSamples;
+        const hopTile = Math.floor(windowSamples / 2);
+        const tilesForChunk =
+          chunkSize <= windowSamples
+            ? 1
+            : Math.ceil((chunkSize - windowSamples) / hopTile) + 1;
+        self.postMessage({
+          type: "tiling-info",
+          payload: {
+            framesSpan,
+            hopSamples,
+            windowSamples,
+            windowSeconds: windowSamples / sampleRate,
+            chunkSize,
+            tilesForChunk,
+            overlap: 0.5,
+          },
+        });
+      } catch (err) {
+        self.postMessage({
+          type: "error",
+          payload: makeErrorPayload(err, "query-tiling"),
+        });
+      }
+      return;
+    }
     case "set-backend": {
       try {
         preferredBackend = payload?.preference === "cpu" ? "cpu" : "auto";
@@ -289,13 +337,50 @@ self.onmessage = async (e) => {
         // Precompute features for first group/slice
         let nextFeaturesB = null;
         let firstBatchLogged = false;
+        // Determine dynamic receptive field in samples (framesSpan * hopSamples)
+        const getFramesSpan = () => {
+          try {
+            const ins = (engine.model && engine.model.inputs) || [];
+            for (const info of ins) {
+              const sh = info && info.shape;
+              if (Array.isArray(sh) && sh.length === 4) {
+                const tDim = sh[1];
+                if (typeof tDim === "number" && tDim > 0) return tDim;
+              }
+            }
+          } catch (_) {}
+          return 512;
+        };
+        const FRAMES_SPAN = getFramesSpan();
+        const STFT_HOP_SAMPLES = 1024; // matches inference precompute
+        const MAX_WIN_SAMPLES = FRAMES_SPAN * STFT_HOP_SAMPLES;
+        // Inform UI about computed receptive window and expected tiling for this chunk size
+        try {
+          const hopSamplesTile = Math.floor(MAX_WIN_SAMPLES / 2);
+          const tilesForChunk =
+            chunkSize <= MAX_WIN_SAMPLES
+              ? 1
+              : Math.ceil((chunkSize - MAX_WIN_SAMPLES) / hopSamplesTile) + 1;
+          self.postMessage({
+            type: "tiling-info",
+            payload: {
+              framesSpan: FRAMES_SPAN,
+              hopSamples: STFT_HOP_SAMPLES,
+              windowSamples: MAX_WIN_SAMPLES,
+              windowSeconds: MAX_WIN_SAMPLES / sampleRate,
+              chunkSize,
+              tilesForChunk,
+              overlap: 0.5,
+            },
+          });
+        } catch (_) {}
         // Helper: run a slice through engine, internally tiling if too long
         const runTiledMono = async (slice, sampleRate, opts) => {
           const T = slice && slice[0] ? slice[0].length : 0;
           if (T <= 0)
             return { stems: new Array(numStems).fill(new Float32Array(0)) };
-          // Empirically safe max window that preserves full activation (~11.9s)
-          const maxWin = (44100 * 11.9) | 0;
+          // Dynamic receptive window length in samples
+          const maxWin = MAX_WIN_SAMPLES;
           if (T <= maxWin) return engine.runChunk(slice, sampleRate, opts);
           const hop = Math.floor(maxWin / 2);
           const parts = [];
@@ -305,11 +390,26 @@ self.onmessage = async (e) => {
             parts.push({ start, end });
             if (end === T) break;
           }
-          const partials = [];
-          for (const p of parts) {
-            const sub = slice.map((ch) => ch.subarray(p.start, p.end));
-            const r = await engine.runChunk(sub, sampleRate, opts);
-            partials.push(r.stems);
+          // Batch the sub-tiles where possible
+          let partials = [];
+          try {
+            const subSlicesB = parts.map((p) =>
+              slice.map((ch) => ch.subarray(p.start, p.end))
+            );
+            const batched = await engine.runChunks(subSlicesB, sampleRate, {
+              stickyBackend: !!opts?.stickyBackend,
+              forceCpu: !!opts?.forceCpu,
+            });
+            partials = batched && batched.stemsB ? batched.stemsB : [];
+            if (!partials.length) throw new Error("empty batched result");
+          } catch (_) {
+            // Fallback to per-part singles
+            partials = [];
+            for (const p of parts) {
+              const sub = slice.map((ch) => ch.subarray(p.start, p.end));
+              const r = await engine.runChunk(sub, sampleRate, opts);
+              partials.push(r.stems);
+            }
           }
           // OLA stitch for each stem
           const out = new Array(numStems)
@@ -362,8 +462,10 @@ self.onmessage = async (e) => {
             let resB;
             let t0 = performance.now();
             try {
-              // If any slice exceeds maxWin, fallback to per-slice tiled single runs
-              const tooLong = slicesB.some((sl) => sl[0].length > 44100 * 11.9);
+              // If any slice exceeds dynamic max window, handle per-slice with internal tiling
+              const tooLong = slicesB.some(
+                (sl) => sl[0].length > MAX_WIN_SAMPLES
+              );
               if (tooLong) {
                 const stemsB = [];
                 for (let j = 0; j < group.length; j++) {

@@ -27,6 +27,9 @@
       <span id="backendStatus" style="margin-left: 12px; color: #666"
         >Backend: —</span
       >
+      <span id="windowInfo" style="margin-left: 12px; color: #666"
+        >Window: —</span
+      >
       <label style="margin-left: 12px"
         ><input id="forceCpuChk" type="checkbox" /> Force CPU</label
       >
@@ -43,6 +46,7 @@
           value="30"
           style="width: 60px"
       /></label>
+      <button id="setIdealBtn" style="margin-left: 8px">Use Ideal</button>
       <label style="margin-left: 12px"
         >Progress ms:
         <input
@@ -138,6 +142,8 @@
       const loadModelBtn = document.getElementById("loadModelBtn");
       const preloadAllBtn = document.getElementById("preloadAllBtn");
       const startBtn = document.getElementById("startBtn");
+      const chunkSecInput = document.getElementById("chunkSec");
+      const setIdealBtn = document.getElementById("setIdealBtn");
 
       const workerUrl = new URL("./js/worker.js", import.meta.url);
       const worker = new Worker(workerUrl, { type: "module" });
@@ -172,6 +178,18 @@
         log("Worker messageerror: " + String(ev?.data ?? ""));
         console.error("Worker messageerror", ev);
       });
+      // Query tiling info helper
+      const queryTiling = () => {
+        const stems = Number(stemsSelect.value) || 2;
+        const chunkSize = Math.max(
+          1,
+          Math.floor(44100 * (Number(chunkSecInput.value) || 10))
+        );
+        worker.postMessage({
+          type: "query-tiling",
+          payload: { stems, sampleRate: 44100, chunkSize },
+        });
+      };
       // Backend control
       const forceCpuChk = document.getElementById("forceCpuChk");
       forceCpuChk.addEventListener("change", () => {
@@ -333,6 +351,16 @@
         if (type === "debug") {
           if (verboseChk.checked && payload?.message)
             log(`[worker] ${payload.message}`);
+          return;
+        }
+        if (type === "tiling-info") {
+          const p = payload || {};
+          const secs = (p.windowSeconds || 0).toFixed(2);
+          const tiles = p.tilesForChunk || 1;
+          const info = `Window: ${p.windowSamples} samples (~${secs}s) [${p.framesSpan}×${p.hopSamples}], tiles for chunk: ${tiles}`;
+          const wi = document.getElementById("windowInfo");
+          if (wi) wi.textContent = info;
+          log(info);
           return;
         }
         if (type === "batch-auto-selected") {
@@ -545,6 +573,8 @@
             log(`IO detail: inputs=[${ins}]`);
             log(`IO detail: outputs=[${outs}]`);
           }
+          // Query tiling once the model is ready
+          queryTiling();
         } else if (type === "model-progress") {
           log(
             `Preload ${payload.index}/${payload.total}: ${
@@ -631,6 +661,23 @@
         log("Load Model clicked");
         const stems = Number(stemsSelect.value);
         worker.postMessage({ type: "load-model", payload: { stems } });
+      };
+      stemsSelect.onchange = () => queryTiling();
+      chunkSecInput.onchange = () => queryTiling();
+      setIdealBtn.onclick = () => {
+        const wi = document.getElementById("windowInfo");
+        const text = wi?.textContent || "";
+        const m = text.match(/~([0-9]+\.[0-9]+)s/);
+        if (m) {
+          const ideal = parseFloat(m[1]);
+          if (!isNaN(ideal)) {
+            chunkSecInput.value = ideal.toFixed(2);
+            log(`Set chunk to ideal ~${ideal.toFixed(2)}s`);
+            queryTiling();
+          }
+        } else {
+          log("Ideal window not available yet; load a model first.");
+        }
       };
       preloadAllBtn.onclick = () => {
         log("Preload All clicked");
