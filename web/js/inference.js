@@ -10,6 +10,7 @@ export class InferenceEngine {
     this.modelUrl = null;
     this.io = { inputs: [], outputs: [] };
     this._fillNonAudioWithNoise = true;
+    this._zeroPadCache = new Map(); // key: `${type}:${len}:${bins}:${ch}` -> tf.Tensor
   }
 
   // Returns true if the current model IO indicates a batch dimension that we can exploit
@@ -132,6 +133,26 @@ export class InferenceEngine {
       stftImag: imagArr,
       magArr,
     };
+  }
+
+  _getZeroPad(len, bins, ch, type = "mag") {
+    // type: "mag" (shape [len, 1024, 2]) or "complex" (shape [len, 2049, 2])
+    // Returns a cached tf.zeros tensor of requested shape.
+    const key = `${type}:${len}:${bins}:${ch}`;
+    let t = this._zeroPadCache.get(key);
+    if (t && !t.isDisposedInternal) return t;
+    // Lazily create and cache
+    const tf = (
+      typeof window !== "undefined" && window.tf
+    )
+      ? window.tf
+      : (typeof self !== "undefined" && self.tf)
+      ? self.tf
+      : null;
+    if (!tf) throw new Error("TF.js not initialized for zero pad");
+    t = tf.zeros([len, bins, ch], "float32");
+    this._zeroPadCache.set(key, t);
+    return t;
   }
 
   async runChunk(channelsOrMono, sampleRate, opts = {}) {
@@ -265,22 +286,16 @@ export class InferenceEngine {
             const imagT = tf.tensor(f.stftImag, [f.time, 2049, 2], "float32");
             const rs = realT.slice([0, 0, 0], [f.tSpan, 2049, 2]);
             const is = imagT.slice([0, 0, 0], [f.tSpan, 2049, 2]);
-            const rpad =
-              f.tSpan === 512
-                ? null
-                : tf.zeros([512 - f.tSpan, 2049, 2], "float32");
-            const ipad =
-              f.tSpan === 512
-                ? null
-                : tf.zeros([512 - f.tSpan, 2049, 2], "float32");
+            const needPad = 512 - f.tSpan;
+            const rpad = needPad > 0 ? this._getZeroPad(needPad, 2049, 2, "complex") : null;
+            const ipad = needPad > 0 ? rpad : null; // reuse same zeros
             const r512 = rpad ? tf.concat([rs, rpad], 0) : rs;
             const i512 = ipad ? tf.concat([is, ipad], 0) : is;
             realT.dispose();
             imagT.dispose();
             rs.dispose();
             is.dispose();
-            if (rpad) rpad.dispose();
-            if (ipad) ipad.dispose();
+            // cached pads are persistent; do not dispose
             const c = tf.complex(r512, i512);
             r512.dispose();
             i512.dispose();
@@ -300,11 +315,11 @@ export class InferenceEngine {
           const mags = feats.map((f) => {
             const magT = tf.tensor(f.magArr, [f.time, 1024, 2], "float32");
             const magSlice = magT.slice([0, 0, 0], [f.tSpan, 1024, 2]);
-            const pad =
-              f.tSpan === 512 ? null : tf.zeros([512 - f.tSpan, 1024, 2]);
+            const needPad = 512 - f.tSpan;
+            const pad = needPad > 0 ? this._getZeroPad(needPad, 1024, 2, "mag") : null;
             const patch = pad ? tf.concat([magSlice, pad], 0) : magSlice;
             magT.dispose();
-            if (pad) pad.dispose();
+            // cached pad persists
             magSlice.dispose();
             return patch.expandDims(0); // [1,512,1024,2]
           });

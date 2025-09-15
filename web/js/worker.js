@@ -334,9 +334,10 @@ self.onmessage = async (e) => {
           } catch (_) {}
           return null;
         };
-        // Precompute features for first group/slice
-        let nextFeaturesB = null;
-        let firstBatchLogged = false;
+  // Precompute features for upcoming groups (prefetch depth)
+  let nextFeaturesB = null;
+  let firstBatchLogged = false;
+  const PREFETCH_DEPTH = 2;
         // Determine dynamic receptive field in samples (framesSpan * hopSamples)
         const getFramesSpan = () => {
           try {
@@ -393,15 +394,23 @@ self.onmessage = async (e) => {
           // Batch the sub-tiles where possible
           let partials = [];
           try {
-            const subSlicesB = parts.map((p) =>
-              slice.map((ch) => ch.subarray(p.start, p.end))
-            );
-            const batched = await engine.runChunks(subSlicesB, sampleRate, {
-              stickyBackend: !!opts?.stickyBackend,
-              forceCpu: !!opts?.forceCpu,
-            });
-            partials = batched && batched.stemsB ? batched.stemsB : [];
-            if (!partials.length) throw new Error("empty batched result");
+            // Batch tiles in smaller groups to reduce memory pressure
+            const TILE_BATCH = 3;
+            const stemsB_all = [];
+            for (let i = 0; i < parts.length; i += TILE_BATCH) {
+              const group = parts.slice(i, i + TILE_BATCH);
+              const subSlicesB = group.map((p) =>
+                slice.map((ch) => ch.subarray(p.start, p.end))
+              );
+              const batched = await engine.runChunks(subSlicesB, sampleRate, {
+                stickyBackend: !!opts?.stickyBackend,
+                forceCpu: !!opts?.forceCpu,
+              });
+              const stemsB = batched && batched.stemsB ? batched.stemsB : [];
+              if (!stemsB.length) throw new Error("empty batched result");
+              stemsB_all.push(...stemsB);
+            }
+            partials = stemsB_all;
           } catch (_) {
             // Fallback to per-part singles
             partials = [];
@@ -411,19 +420,28 @@ self.onmessage = async (e) => {
               partials.push(r.stems);
             }
           }
-          // OLA stitch for each stem
+          // OLA stitch for each stem with Hann crossfade
           const out = new Array(numStems)
             .fill(null)
             .map(() => new Float32Array(T));
           const weight = new Float32Array(T);
-          // triangular window per part
+          const hann = (n) => {
+            const w = new Float32Array(n);
+            if (n === 1) {
+              w[0] = 1;
+              return w;
+            }
+            for (let i = 0; i < n; i++) w[i] = 0.5 * (1 - Math.cos((2 * Math.PI * i) / (n - 1)));
+            return w;
+          };
           for (let pi = 0; pi < parts.length; pi++) {
             const p = parts[pi];
             const len = p.end - p.start;
+            const wv = hann(len);
             for (let s = 0; s < numStems; s++) {
               const src = partials[pi][s];
               for (let t = 0; t < len; t++) {
-                const w = 1 - Math.abs((2 * t) / (len - 1) - 1);
+                const w = wv[t];
                 out[s][p.start + t] += src[t] * w;
                 if (s === 0) weight[p.start + t] += w; // weight once
               }
@@ -450,7 +468,7 @@ self.onmessage = async (e) => {
             // Kick off precompute for the next group early
             const nextGroup = chunks.slice(
               i + group.length,
-              Math.min(chunks.length, i + group.length + bs)
+              Math.min(chunks.length, i + group.length + bs * PREFETCH_DEPTH)
             );
             const nextSlicesB = nextGroup.map((c) =>
               channels.map((ch) => ch.subarray(c.start, c.end))
@@ -525,6 +543,11 @@ self.onmessage = async (e) => {
               continue;
             }
             const t1 = performance.now();
+            if (verbose)
+              self.postMessage({
+                type: "debug",
+                payload: { message: `[worker] batched group time ${(t1 - t0).toFixed(1)} ms` },
+              });
             // Resolve next features after execute completes
             nextFeaturesB = nextFeatPromise ? await nextFeatPromise : null;
             const stemsB = resB?.stemsB || [];
