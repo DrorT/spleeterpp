@@ -48,16 +48,14 @@ export class InferenceEngine {
 
   async load(modelUrlOrStems) {
     const tf = await ensureTF();
+    // Prefer GPU (WebGL) if available; fall back to CPU on failure
     try {
-      if (tf.getBackend && tf.getBackend() !== "cpu") {
-        await tf.setBackend("cpu");
-        await tf.ready();
-      }
-    } catch (_) {}
-    // Prefer CPU for stability (feature compute + model exec in same backend)
-    try {
-      await configureBackend("cpu");
-    } catch (_) {}
+      await configureBackend("auto"); // tries webgl, then falls back to cpu
+    } catch (_) {
+      try {
+        await configureBackend("cpu");
+      } catch (_) {}
+    }
     const modelUrl =
       typeof modelUrlOrStems === "number"
         ? `/models/${modelUrlOrStems}stems/model.json`
