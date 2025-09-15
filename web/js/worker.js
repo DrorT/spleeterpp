@@ -2,9 +2,11 @@
 
 import { planChunks, overlapAddStitchMono } from "./chunking.js";
 import { InferenceEngine } from "./inference.js";
+import { configureBackend } from "./tf-backend.js";
 
 let cancelRequested = false;
 let verbose = false;
+let preferredBackend = "auto"; // 'auto' or 'cpu'
 
 // Signal readiness as soon as the module loads
 self.postMessage({ type: "worker-ready" });
@@ -31,6 +33,22 @@ self.onmessage = async (e) => {
   // Keep initial debug minimal; verbose logs are filtered in UI
   // self.postMessage({ type: "debug", payload: { message: `Worker received message: ${type}` } });
   switch (type) {
+    case "set-backend": {
+      try {
+        preferredBackend = payload?.preference === "cpu" ? "cpu" : "auto";
+        const info = await configureBackend(preferredBackend);
+        self.postMessage({
+          type: "backend-set",
+          payload: { backend: info.backend },
+        });
+      } catch (err) {
+        self.postMessage({
+          type: "error",
+          payload: makeErrorPayload(err, "set-backend"),
+        });
+      }
+      return;
+    }
     case "set-verbose": {
       verbose = !!payload?.verbose;
       self.postMessage({
@@ -120,6 +138,10 @@ self.onmessage = async (e) => {
           batchSize = 1,
           tag: reqTag,
         } = payload;
+        // Apply preferred backend before processing
+        try {
+          await configureBackend(preferredBackend);
+        } catch (_) {}
         const tMsg0 = performance.now();
         const tTotal0 = tMsg0;
         self.postMessage({
@@ -294,6 +316,7 @@ self.onmessage = async (e) => {
             try {
               resB = await engine.runChunks(slicesB, sampleRate, {
                 stickyBackend: true,
+                forceCpu: preferredBackend === "cpu",
                 featuresB:
                   nextFeaturesB && nextFeaturesB.length === slicesB.length
                     ? nextFeaturesB
@@ -317,6 +340,7 @@ self.onmessage = async (e) => {
                 const tS0 = performance.now();
                 const res = await engine.runChunk(slice, sampleRate, {
                   stickyBackend: true,
+                  forceCpu: preferredBackend === "cpu",
                 });
                 const tS1 = performance.now();
                 for (let s = 0; s < numStems; s++)
@@ -388,6 +412,7 @@ self.onmessage = async (e) => {
             let t0 = performance.now();
             const result = await engine.runChunk(slice, sampleRate, {
               stickyBackend: true,
+              forceCpu: preferredBackend === "cpu",
               features: nextFeaturesB || (await nextFeatPromise),
             });
             const t1 = performance.now();

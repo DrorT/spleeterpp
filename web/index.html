@@ -28,6 +28,9 @@
         >Backend: —</span
       >
       <label style="margin-left: 12px"
+        ><input id="forceCpuChk" type="checkbox" /> Force CPU</label
+      >
+      <label style="margin-left: 12px"
         ><input type="checkbox" id="verboseChk" /> Verbose logs</label
       >
       <label style="margin-left: 12px"
@@ -37,7 +40,7 @@
           type="number"
           min="2"
           max="20"
-          value="10"
+          value="30"
           style="width: 60px"
       /></label>
       <label style="margin-left: 12px"
@@ -53,8 +56,8 @@
       <label style="margin-left: 12px"
         >Batch:
         <select id="batchSize" style="width: 80px">
-          <option value="auto" selected>auto</option>
-          <option value="1">1</option>
+          <option value="auto">auto</option>
+          <option value="1" selected>1</option>
           <option value="2">2</option>
           <option value="3">3</option>
           <option value="4">4</option>
@@ -82,7 +85,7 @@
             type="number"
             min="2"
             max="60"
-            value="20"
+            value="30"
             style="width: 60px"
           />
         </label>
@@ -94,9 +97,11 @@
       </span>
     </div>
     <pre id="log">Loading...</pre>
+    <div id="stemsContainer" style="margin-top: 12px"></div>
     <script type="module">
       // import { createSpleeterWasm } from "./js/spleeter-wasm.js";
       import { resampleTo44100, decodeArrayBufferToPCM } from "./js/audio.js";
+      import { float32ToWavMono } from "./js/wav.js";
       import { checkGPUSupport } from "./js/tf-backend.js";
 
       const logEl = document.getElementById("log");
@@ -163,6 +168,16 @@
         log("Worker messageerror: " + String(ev?.data ?? ""));
         console.error("Worker messageerror", ev);
       });
+      // Backend control
+      const forceCpuChk = document.getElementById("forceCpuChk");
+      forceCpuChk.addEventListener("change", () => {
+        const force = !!forceCpuChk.checked;
+        worker.postMessage({
+          type: "set-backend",
+          payload: { preference: force ? "cpu" : "auto" },
+        });
+        log(`[ui] backend preference: ${force ? "cpu" : "auto"}`);
+      });
       // Simple event-loop lag monitor
       let lastTick = performance.now();
       setInterval(() => {
@@ -190,11 +205,72 @@
 
       // A/B compare state
       const abState = { active: false, tags: {}, results: {} };
+      // Manage stem players
+      let currentStemURLs = [];
+      const clearStemPlayers = () => {
+        try {
+          currentStemURLs.forEach((u) => URL.revokeObjectURL(u));
+        } catch (_) {}
+        currentStemURLs = [];
+        const cont = document.getElementById("stemsContainer");
+        if (cont) cont.innerHTML = "";
+      };
+      const renderStems = (payload) => {
+        const cont = document.getElementById("stemsContainer");
+        if (!cont) return;
+        clearStemPlayers();
+        const stems = payload?.stems || [];
+        const sr = payload?.sampleRate || 44100;
+        const num = stems.length;
+        const namesByCount = {
+          2: ["vocals", "accompaniment"],
+          4: ["vocals", "drums", "bass", "other"],
+          5: ["vocals", "drums", "bass", "piano", "other"],
+        };
+        const stemNames =
+          namesByCount[num] || stems.map((_, i) => `stem${i + 1}`);
+        stems.forEach((data, idx) => {
+          const blob = float32ToWavMono(data, sr);
+          const url = URL.createObjectURL(blob);
+          currentStemURLs.push(url);
+          const wrap = document.createElement("div");
+          wrap.style.marginTop = "6px";
+          const label = document.createElement("div");
+          label.textContent = `${stemNames[idx] || `stem${idx + 1}`}`;
+          const audio = document.createElement("audio");
+          audio.controls = true;
+          audio.src = url;
+          audio.style.display = "block";
+          audio.style.width = "100%";
+          const a = document.createElement("a");
+          a.href = url;
+          a.download = `${stemNames[idx] || `stem${idx + 1}`}${
+            payload?.tag ? `_${payload.tag}` : ""
+          }.wav`;
+          `stem${idx + 1}.wav` + (payload?.tag ? `_${payload.tag}` : "");
+          a.textContent = "Download";
+          a.style.display = "inline-block";
+          a.style.marginTop = "2px";
+          wrap.appendChild(label);
+          wrap.appendChild(audio);
+          wrap.appendChild(a);
+          cont.appendChild(wrap);
+        });
+      };
 
       worker.onmessage = async (e) => {
         const { type, payload } = e.data || {};
         if (type === "worker-ready") {
           log("Worker ready");
+          return;
+        }
+        if (type === "backend-set") {
+          const { backend } = payload || {};
+          if (backend) {
+            const be = document.getElementById("backendStatus");
+            if (be) be.textContent = `Backend: ${backend}`;
+            log(`[worker] backend set to ${backend}`);
+          }
           return;
         }
         if (type === "debug") {
@@ -251,6 +327,7 @@
         } else if (type === "done") {
           cancelBtn.disabled = true;
           log("Done" + (payload?.tag ? ` [tag=${payload.tag}]` : ""));
+          renderStems(payload);
           if (payload?.backend) {
             log(`Backend used: ${payload.backend}`);
             const be = document.getElementById("backendStatus");
@@ -356,7 +433,7 @@
               const ctx = new (window.AudioContext ||
                 window.webkitAudioContext)();
               if (ctx.state === "suspended") await ctx.resume();
-              const data = payload.stems[0];
+              const data = payload.stems[1];
               const nonZero = data.some((v) => v !== 0);
               log(`First stem preview: len=${data.length} nonZero=${nonZero}`);
               let playData = data;
@@ -423,6 +500,7 @@
           );
           if (payload?.context) log(`Context: ${payload.context}`);
           if (payload?.stack) log(payload.stack);
+          clearStemPlayers();
         }
       };
       // Run A/B compare: runs two process-audio with different chunk sizes and compares RMS
@@ -454,7 +532,7 @@
         const stems = Number(stemsSelect.value);
         const progressIntervalMs =
           Number(document.getElementById("progressMs").value) || 250;
-        const batchSize = document.getElementById("batchSize").value || "auto";
+        const batchSize = document.getElementById("batchSize").value || "1";
         abState.active = true;
         abState.results = {};
         // Kick A then B
@@ -595,8 +673,7 @@
           const stems = Number(stemsSelect.value);
           const progressIntervalMs =
             Number(document.getElementById("progressMs").value) || 250;
-          const batchSize =
-            document.getElementById("batchSize").value || "auto";
+          const batchSize = document.getElementById("batchSize").value || "1";
           worker.postMessage({
             type: "process-audio",
             payload: {

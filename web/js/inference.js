@@ -954,8 +954,13 @@ export class InferenceEngine {
       let triedWebGL = false;
       let execBackend = tf.getBackend();
       const prevBackend = execBackend;
-      // Try switch to WebGL just for model execution
+      // Try switch to WebGL just for model execution (unless forceCpu)
       try {
+        if (opts?.forceCpu) {
+          triedWebGL = false;
+          execBackend = tf.getBackend();
+          throw new Error("forceCpu enabled");
+        }
         if (prevBackend !== "webgl") {
           try {
             await tf.setBackend("webgl");
@@ -993,11 +998,21 @@ export class InferenceEngine {
             eSwitch && eSwitch.message ? eSwitch.message : eSwitch
           }`
         );
-        try {
-          await tf.setBackend(prevBackend);
-          await tf.ready();
-        } catch (_) {}
-        execBackend = prevBackend;
+        if (opts?.forceCpu) {
+          try {
+            await tf.setBackend("cpu");
+            await tf.ready();
+            execBackend = "cpu";
+          } catch (_) {
+            execBackend = tf.getBackend();
+          }
+        } else {
+          try {
+            await tf.setBackend(prevBackend);
+            await tf.ready();
+          } catch (_) {}
+          execBackend = prevBackend;
+        }
       }
       // If we have deferred feature tensors to fill, materialize them now on the active backend
       if (features && (complexNames.length || mag4dNames.length)) {
@@ -1144,6 +1159,11 @@ export class InferenceEngine {
       let execBackend = tf.getBackend();
       const prevBackend = execBackend;
       try {
+        if (opts?.forceCpu) {
+          triedWebGL = false;
+          execBackend = tf.getBackend();
+          throw new Error("forceCpu enabled");
+        }
         if (prevBackend !== "webgl") {
           try {
             await tf.setBackend("webgl");
@@ -1177,11 +1197,21 @@ export class InferenceEngine {
             eSwitch && eSwitch.message ? eSwitch.message : eSwitch
           }`
         );
-        try {
-          await tf.setBackend(prevBackend);
-          await tf.ready();
-        } catch (_) {}
-        execBackend = prevBackend;
+        if (opts?.forceCpu) {
+          try {
+            await tf.setBackend("cpu");
+            await tf.ready();
+            execBackend = "cpu";
+          } catch (_) {
+            execBackend = tf.getBackend();
+          }
+        } else {
+          try {
+            await tf.setBackend(prevBackend);
+            await tf.ready();
+          } catch (_) {}
+          execBackend = prevBackend;
+        }
       }
       // Materialize all-input features if needed on active backend
       if (features && (allComplexNames.length || allMag4dNames.length)) {
