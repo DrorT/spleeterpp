@@ -9,6 +9,23 @@ let verbose = false;
 // Signal readiness as soon as the module loads
 self.postMessage({ type: "worker-ready" });
 
+function makeErrorPayload(err, context) {
+  const message = (err && err.message) || String(err);
+  const stack = (err && err.stack) || "";
+  let site = "";
+  try {
+    const lines = String(stack).split("\n");
+    for (const ln of lines) {
+      const m = ln.match(/(\(?)([^)\s]+):(\d+):(\d+)\)?$/);
+      if (m) {
+        site = `${m[2]}:${m[3]}:${m[4]}`;
+        break;
+      }
+    }
+  } catch (_) {}
+  return { context, message, site, stack, name: err?.name };
+}
+
 self.onmessage = async (e) => {
   const { type, payload } = e.data || {};
   // Keep initial debug minimal; verbose logs are filtered in UI
@@ -50,10 +67,7 @@ self.onmessage = async (e) => {
       } catch (err) {
         self.postMessage({
           type: "error",
-          payload: {
-            message:
-              "Model load failed: " + ((err && err.message) || String(err)),
-          },
+          payload: makeErrorPayload(err, "load-model"),
         });
       }
       return;
@@ -85,9 +99,7 @@ self.onmessage = async (e) => {
       } catch (err) {
         self.postMessage({
           type: "error",
-          payload: {
-            message: "Preload failed: " + ((err && err.message) || String(err)),
-          },
+          payload: makeErrorPayload(err, "preload-all-models"),
         });
       }
       return;
@@ -106,8 +118,10 @@ self.onmessage = async (e) => {
           channels,
           numStems = 2,
           precision = "auto",
+          batchSize = 1,
         } = payload;
         const tMsg0 = performance.now();
+        const tTotal0 = tMsg0;
         self.postMessage({
           type: "processing-start",
           payload: { frames, chunkSize, hopSize, numStems },
@@ -153,66 +167,262 @@ self.onmessage = async (e) => {
         );
         let lastProgressTime = 0;
         let errorOnce = false;
-        for (let i = 0; i < chunks.length; i++) {
+        const isAuto = String(batchSize) === "auto";
+        const bsFixed = Math.max(1, Math.min(4, Number(batchSize) || 1));
+        let bs = bsFixed;
+        const canBatch =
+          typeof engine.supportsBatching === "function" &&
+          !!engine.supportsBatching();
+        if (verbose)
+          self.postMessage({
+            type: "debug",
+            payload: {
+              message: `[worker] batching requested=${String(
+                batchSize
+              )} supported=${canBatch}`,
+            },
+          });
+        // Declare loop index before any closures that may reference it
+        let i = 0;
+        const chooseAuto = async () => {
+          const tried = [];
+          let idx = 0;
+          const maxProbe = Math.min(chunks.length - idx, 4);
+          for (let k = 1; k <= 4 && k <= maxProbe; k++) {
+            const group = chunks.slice(idx, idx + k);
+            const slicesB = group.map((c) =>
+              channels.map((ch) => ch.subarray(c.start, c.end))
+            );
+            try {
+              // Pre-warm for batched shapes so timing is fair
+              if (canBatch && k > 1) {
+                try {
+                  await engine.runChunks(slicesB, sampleRate, {
+                    precision,
+                    stickyBackend: true,
+                  });
+                } catch (_) {
+                  // ignore warmup errors and fall through to timed attempt
+                }
+              }
+              const t0 = performance.now();
+              const resB =
+                canBatch && k > 1
+                  ? await engine.runChunks(slicesB, sampleRate, { precision })
+                  : await Promise.all(
+                      slicesB.map((slice) =>
+                        engine.runChunk(slice, sampleRate, { precision })
+                      )
+                    ).then((arr) => ({ stemsB: arr.map((r) => r.stems) }));
+              const t1 = performance.now();
+              const stemsB = resB?.stemsB || [];
+              for (let j = 0; j < group.length; j++) {
+                const c = group[j];
+                const stems = stemsB[j];
+                for (let s = 0; s < numStems; s++)
+                  perStemOutputs[s].push(stems[s]);
+                self.postMessage({
+                  type: "progress",
+                  payload: {
+                    index: idx + j + 1,
+                    total: chunks.length,
+                    start: c.start,
+                    end: c.end,
+                    durationMs: (t1 - t0) / group.length,
+                  },
+                });
+              }
+              tried.push({ k, msPerChunk: (t1 - t0) / group.length, ok: true });
+              idx += group.length;
+            } catch (_) {
+              tried.push({ k, msPerChunk: Infinity, ok: false });
+              break;
+            }
+          }
+          if (tried.length === 0) return 1;
+          const ok = tried.filter((t) => t.ok);
+          if (ok.length === 0) return 1;
+          ok.sort((a, b) => a.msPerChunk - b.msPerChunk);
+          const best = ok[0];
+          self.postMessage({
+            type: "batch-auto-selected",
+            payload: { k: best.k, results: tried },
+          });
+          // Advance i by processed chunks
+          i = idx;
+          return best.k;
+        };
+        if (isAuto) bs = await chooseAuto();
+        // Prepare a simple feature precompute pipeline
+        const precompute = (slice) => {
+          try {
+            if (typeof engine.precomputeFeatures === "function") {
+              return engine.precomputeFeatures(slice);
+            }
+          } catch (_) {}
+          return null;
+        };
+        // Precompute features for first group/slice
+        let nextFeaturesB = null;
+        let firstBatchLogged = false;
+        while (i < chunks.length) {
           if (cancelRequested) {
             self.postMessage({ type: "cancelled" });
             return;
           }
-          const c = chunks[i];
-          // Slice channels per chunk
-          const slice = channels.map((ch) => ch.subarray(c.start, c.end));
-          let result;
-          let t0, t1;
-          try {
-            t0 = performance.now();
-            result = await engine.runChunk(slice, sampleRate, { precision });
-            t1 = performance.now();
-          } catch (e) {
-            if (!errorOnce) {
+          if (canBatch && bs > 1) {
+            const group = chunks.slice(i, Math.min(chunks.length, i + bs));
+            const slicesB = group.map((c) =>
+              channels.map((ch) => ch.subarray(c.start, c.end))
+            );
+            // Kick off precompute for the next group early
+            const nextGroup = chunks.slice(
+              i + group.length,
+              Math.min(chunks.length, i + group.length + bs)
+            );
+            const nextSlicesB = nextGroup.map((c) =>
+              channels.map((ch) => ch.subarray(c.start, c.end))
+            );
+            const nextFeatPromise =
+              nextSlicesB.length > 0
+                ? Promise.all(nextSlicesB.map((sl) => precompute(sl)))
+                : null;
+            let resB;
+            let t0 = performance.now();
+            try {
+              resB = await engine.runChunks(slicesB, sampleRate, {
+                precision,
+                stickyBackend: true,
+                featuresB:
+                  nextFeaturesB && nextFeaturesB.length === slicesB.length
+                    ? nextFeaturesB
+                    : undefined,
+              });
+              if (!firstBatchLogged && verbose) {
+                firstBatchLogged = true;
+                self.postMessage({
+                  type: "debug",
+                  payload: {
+                    message:
+                      "First batched group may include JIT/warmup cost; later groups should be faster.",
+                  },
+                });
+              }
+            } catch (e) {
+              // Fallback to single for each in group
+              for (let j = 0; j < group.length; j++) {
+                const c = group[j];
+                const slice = slicesB[j];
+                const tS0 = performance.now();
+                const res = await engine.runChunk(slice, sampleRate, {
+                  precision,
+                  stickyBackend: true,
+                });
+                const tS1 = performance.now();
+                for (let s = 0; s < numStems; s++)
+                  perStemOutputs[s].push(res.stems[s]);
+                self.postMessage({
+                  type: "progress",
+                  payload: {
+                    index: i + j + 1,
+                    total: chunks.length,
+                    start: c.start,
+                    end: c.end,
+                    durationMs: tS1 - tS0,
+                  },
+                });
+              }
+              i += group.length;
+              continue;
+            }
+            const t1 = performance.now();
+            // Resolve next features after execute completes
+            nextFeaturesB = nextFeatPromise ? await nextFeatPromise : null;
+            const stemsB = resB?.stemsB || [];
+            for (let j = 0; j < group.length; j++) {
+              const c = group[j];
+              const stems = stemsB[j];
+              for (let s = 0; s < numStems; s++)
+                perStemOutputs[s].push(stems[s]);
+              const now = performance.now();
+              if (
+                now - lastProgressTime >= progressIntervalMs ||
+                i + j === chunks.length - 1
+              ) {
+                const tProg0 = now;
+                self.postMessage({
+                  type: "progress",
+                  payload: {
+                    index: i + j + 1,
+                    total: chunks.length,
+                    start: c.start,
+                    end: c.end,
+                    durationMs: (t1 - t0) / group.length,
+                  },
+                });
+                const tProg1 = performance.now();
+                if (verbose)
+                  self.postMessage({
+                    type: "debug",
+                    payload: {
+                      message: `[worker] progress ${i + j + 1}/${
+                        chunks.length
+                      } batched`,
+                    },
+                  });
+                lastProgressTime = now;
+              }
+            }
+            i += group.length;
+          } else {
+            const c = chunks[i];
+            const slice = channels.map((ch) => ch.subarray(c.start, c.end));
+            // Start computing features for next slice early
+            const nextC = chunks[i + 1];
+            const nextSlice =
+              nextC &&
+              channels.map((ch) => ch.subarray(nextC.start, nextC.end));
+            const nextFeatPromise = nextSlice ? precompute(nextSlice) : null;
+            let t0 = performance.now();
+            const result = await engine.runChunk(slice, sampleRate, {
+              precision,
+              stickyBackend: true,
+              features: nextFeaturesB || (await nextFeatPromise),
+            });
+            const t1 = performance.now();
+            nextFeaturesB = null;
+            for (let s = 0; s < numStems; s++)
+              perStemOutputs[s].push(result.stems[s]);
+            await new Promise((r) => setTimeout(r, 0));
+            const now = performance.now();
+            if (
+              now - lastProgressTime >= progressIntervalMs ||
+              i === chunks.length - 1
+            ) {
+              const tProg0 = now;
+              self.postMessage({
+                type: "progress",
+                payload: {
+                  index: i + 1,
+                  total: chunks.length,
+                  start: c.start,
+                  end: c.end,
+                  durationMs: t1 - t0,
+                },
+              });
+              const tProg1 = performance.now();
               if (verbose)
                 self.postMessage({
                   type: "debug",
                   payload: {
-                    message: `[worker] runChunk failed: ${
-                      e && e.message ? e.message : e
-                    }`,
+                    message: `[worker] post progress ${i + 1}/${
+                      chunks.length
+                    } took ${(tProg1 - tProg0).toFixed(2)}ms`,
                   },
                 });
-              errorOnce = true;
+              lastProgressTime = now;
             }
-            throw e;
-          }
-          for (let s = 0; s < numStems; s++)
-            perStemOutputs[s].push(result.stems[s]);
-          // Let UI breathe once per chunk boundary
-          await new Promise((r) => setTimeout(r, 0));
-          const now = performance.now();
-          if (
-            now - lastProgressTime >= progressIntervalMs ||
-            i === chunks.length - 1
-          ) {
-            const tProg0 = now;
-            self.postMessage({
-              type: "progress",
-              payload: {
-                index: i + 1,
-                total: chunks.length,
-                start: c.start,
-                end: c.end,
-                durationMs: t1 - t0,
-              },
-            });
-            const tProg1 = performance.now();
-            if (verbose)
-              self.postMessage({
-                type: "debug",
-                payload: {
-                  message: `[worker] post progress ${i + 1}/${
-                    chunks.length
-                  } took ${(tProg1 - tProg0).toFixed(2)}ms`,
-                },
-              });
-            lastProgressTime = now;
+            i += 1;
           }
         }
         // Stitch per-stem results (mono only for now)
@@ -246,7 +456,12 @@ self.onmessage = async (e) => {
         self.postMessage(
           {
             type: "done",
-            payload: { stems: stitched, sampleRate, stats },
+            payload: {
+              stems: stitched,
+              sampleRate,
+              stats,
+              totalMs: tDone0 - tTotal0,
+            },
           },
           transfer
         );
@@ -263,7 +478,7 @@ self.onmessage = async (e) => {
       } catch (err) {
         self.postMessage({
           type: "error",
-          payload: { message: (err && err.message) || String(err) },
+          payload: makeErrorPayload(err, "process-audio"),
         });
       }
       return;

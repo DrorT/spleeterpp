@@ -51,6 +51,16 @@
           <option value="high">high (F32)</option>
         </select>
       </label>
+      <label style="margin-left: 12px"
+        >Batch:
+        <select id="batchSize" style="width: 80px">
+          <option value="auto" selected>auto</option>
+          <option value="1">1</option>
+          <option value="2">2</option>
+          <option value="3">3</option>
+          <option value="4">4</option>
+        </select>
+      </label>
     </div>
     <pre id="log">Loading...</pre>
     <script type="module">
@@ -91,9 +101,15 @@
       const worker = new Worker(workerUrl, { type: "module" });
       log("Worker created (module)");
       worker.addEventListener("error", (ev) => {
+        const where =
+          ev && ev.filename
+            ? `${ev.filename}:${ev.lineno || 0}:${ev.colno || 0}`
+            : "";
+        if (where) log(`Worker error at ${where}`);
         log(
           "Worker error: " + (ev?.message || ev?.error?.message || String(ev))
         );
+        if (ev?.error?.stack) log(ev.error.stack);
         console.error("Worker error", ev);
       });
       worker.addEventListener("messageerror", (ev) => {
@@ -136,6 +152,18 @@
             log(`[worker] ${payload.message}`);
           return;
         }
+        if (type === "batch-auto-selected") {
+          const k = payload?.k;
+          const results = payload?.results || [];
+          const summary = results
+            .map(
+              (r) =>
+                `${r.k}:${r.ok ? r.msPerChunk.toFixed(2) + "ms/chunk" : "fail"}`
+            )
+            .join("  ");
+          log(`Auto batch: selected k=${k} | ${summary}`);
+          return;
+        }
         if (type === "model-loading") {
           log(`Loading model for ${payload.stems} stems...`);
         } else if (type === "preload-start") {
@@ -159,6 +187,10 @@
         } else if (type === "done") {
           cancelBtn.disabled = true;
           log("Done");
+          if (payload?.totalMs != null) {
+            const sec = (payload.totalMs / 1000).toFixed(2);
+            log(`Total: ${sec}s end-to-end`);
+          }
           if (payload?.stats) {
             payload.stats.forEach((s, i) =>
               log(
@@ -235,7 +267,10 @@
           );
         } else if (type === "error") {
           cancelBtn.disabled = true;
+          if (payload?.site) log(`Error at ${payload.site}`);
           log("Error: " + payload.message);
+          if (payload?.context) log(`Context: ${payload.context}`);
+          if (payload?.stack) log(payload.stack);
         }
       };
 
@@ -332,6 +367,8 @@
             Number(document.getElementById("progressMs").value) || 250;
           const precision =
             document.getElementById("precisionSelect").value || "auto";
+          const batchSize =
+            document.getElementById("batchSize").value || "auto";
           worker.postMessage({
             type: "process-audio",
             payload: {
@@ -343,6 +380,7 @@
               numStems: stems,
               progressIntervalMs,
               precision,
+              batchSize,
             },
           });
         };

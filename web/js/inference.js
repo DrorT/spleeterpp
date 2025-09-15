@@ -12,6 +12,20 @@ export class InferenceEngine {
     this._fillNonAudioWithNoise = true;
   }
 
+  // Returns true if the current model IO indicates a batch dimension that we can exploit
+  // without changing time-frequency patch shapes. Conservative default: true if any input
+  // has rank >= 2 with a first dim unspecified/negative.
+  supportsBatching() {
+    const inputs = this.model?.inputs || [];
+    for (const i of inputs) {
+      const shape = i?.shape || [];
+      if (!Array.isArray(shape) || shape.length < 2) continue;
+      const b0 = shape[0];
+      if (b0 == null || (typeof b0 === "number" && b0 < 0)) return true;
+    }
+    return false;
+  }
+
   _stemOutputNames(n) {
     if (n === 2) return ["strided_slice_13", "strided_slice_23"];
     if (n === 4)
@@ -71,10 +85,361 @@ export class InferenceEngine {
     return { url: this.modelUrl, io: this.io, numStems: this.numStems };
   }
 
+  // Optional offline feature precompute for pipelining
+  // Returns { time, outBins, tSpan, stftReal, stftImag, magArr }
+  // This is CPU-only and independent of tf backend.
+  precomputeFeatures(channelsOrMono) {
+    const channels = Array.isArray(channelsOrMono)
+      ? channelsOrMono
+      : [channelsOrMono];
+    const { channels: st, frames, bins } = stftStereo(channels, 1024);
+    let time = frames;
+    if (!time || time <= 0) time = 1;
+    const outBins = 2049;
+    const ch0 = st[0];
+    const ch1 = st.length > 1 ? st[1] : st[0];
+    const realArr = new Float32Array(time * outBins * 2);
+    const imagArr = new Float32Array(time * outBins * 2);
+    for (let f = 0; f < time; f++) {
+      const base = f * outBins;
+      for (let k = 0; k < outBins; k++) {
+        const i0 = base + k;
+        const dst = (base + k) * 2;
+        realArr[dst + 0] = ch0?.real?.[i0] ?? 0;
+        realArr[dst + 1] = ch1?.real?.[i0] ?? 0;
+        imagArr[dst + 0] = ch0?.imag?.[i0] ?? 0;
+        imagArr[dst + 1] = ch1?.imag?.[i0] ?? 0;
+      }
+    }
+    const magArr = new Float32Array(time * 1024 * 2);
+    for (let f = 0; f < time; f++) {
+      const base = f * outBins;
+      const dstBase = f * 1024 * 2;
+      for (let k = 0; k < 1024; k++) {
+        const i0 = base + k;
+        const r0 = ch0?.real?.[i0] ?? 0;
+        const i0v = ch0?.imag?.[i0] ?? 0;
+        const r1 = ch1?.real?.[i0] ?? 0;
+        const i1v = ch1?.imag?.[i0] ?? 0;
+        magArr[dstBase + k * 2 + 0] = Math.log1p(Math.hypot(r0, i0v));
+        magArr[dstBase + k * 2 + 1] = Math.log1p(Math.hypot(r1, i1v));
+      }
+    }
+    const tSpan = Math.min(512, time);
+    return {
+      time,
+      outBins,
+      tSpan,
+      stftReal: realArr,
+      stftImag: imagArr,
+      magArr,
+    };
+  }
+
   async runChunk(channelsOrMono, sampleRate, opts = {}) {
     // Yield to the event loop before the heavy execution part
     await new Promise((resolve) => setTimeout(resolve, 0));
     return this._runChunkInternal(channelsOrMono, sampleRate, opts);
+  }
+
+  // Batched version: channelsB is an array length B of channel arrays
+  // channelsB[b] = [ch0Float32Array, ch1Float32Array, ...]
+  async runChunks(channelsB, sampleRate, opts = {}) {
+    const tf = await ensureTF();
+    if (!Array.isArray(channelsB) || channelsB.length === 0)
+      return { stemsB: [] };
+    // Fallback to single if model missing
+    if (!this.model) {
+      const single = await this.runChunk(channelsB[0], sampleRate, opts);
+      return { stemsB: [single.stems] };
+    }
+    const B = channelsB.length;
+    // Probe input layout from first sample using runChunk logic up to tensor creation
+    const first = channelsB[0];
+    const inputsInfo = this.model.inputs || [];
+    const getRank = (i) => (i && i.shape ? i.shape.length : 0);
+    const f32Inputs = inputsInfo.filter((i) => i && i.dtype === "float32");
+    let audioInputInfo = null;
+    const rank2or3 = f32Inputs.filter((i) => {
+      const r = getRank(i);
+      return r === 2 || r === 3;
+    });
+    if (rank2or3.length) audioInputInfo = rank2or3[0];
+    else if (f32Inputs.length)
+      audioInputInfo = f32Inputs.sort((a, b) => getRank(a) - getRank(b))[0];
+    else audioInputInfo = inputsInfo[0] || null;
+    const inShape = audioInputInfo?.shape ? audioInputInfo.shape.slice() : null;
+    const rank = inShape ? inShape.length : 3;
+    const dims = (inShape || []).map((d) => (d == null || d < 0 ? null : d));
+    const prepOne = (channels) => {
+      const Cexp = Math.max(1, channels.length);
+      let T = channels[0].length;
+      const prepped = channels.map((ch) => ch);
+      let layout = "BTC";
+      if (rank === 2) {
+        const d0 = dims[0];
+        const d1 = dims[1];
+        if (d1 === channels.length || d1 === 1 || d1 == null) layout = "TC";
+        else if (d0 === channels.length || d0 === 1) layout = "CT";
+        else layout = "TC";
+      } else if (rank >= 3) {
+        const d1 = dims[1];
+        const d2 = dims[2];
+        if (d2 === channels.length || d2 === 1 || d2 == null) layout = "BTC";
+        else if (d1 === channels.length || d1 === 1) layout = "BCT";
+        else layout = "BTC";
+      }
+      return { layout, T, C: channels.length, prepped };
+    };
+    const firstPrep = prepOne(first);
+    const makeAudioTensor = (channels) => {
+      const { layout, T, C, prepped } = prepOne(channels);
+      if (layout === "TC") {
+        const inter = new Float32Array(T * C);
+        let idx = 0;
+        for (let t = 0; t < T; t++)
+          for (let c = 0; c < C; c++) inter[idx++] = prepped[c][t];
+        return { t: tf.tensor(inter, [1, T, C], "float32"), layout: "BTC" };
+      }
+      if (layout === "CT") {
+        const byCh = new Float32Array(T * C);
+        let idx = 0;
+        for (let c = 0; c < C; c++)
+          for (let t = 0; t < T; t++) byCh[idx++] = prepped[c][t];
+        return { t: tf.tensor(byCh, [1, C, T], "float32"), layout: "BCT" };
+      }
+      if (layout === "BCT") {
+        const byCh = new Float32Array(T * C);
+        let idx = 0;
+        for (let c = 0; c < C; c++)
+          for (let t = 0; t < T; t++) byCh[idx++] = prepped[c][t];
+        return { t: tf.tensor(byCh, [1, C, T], "float32"), layout: "BCT" };
+      }
+      // BTC
+      const inter = new Float32Array(T * C);
+      let idx = 0;
+      for (let t = 0; t < T; t++)
+        for (let c = 0; c < C; c++) inter[idx++] = prepped[c][t];
+      return { t: tf.tensor(inter, [1, T, C], "float32"), layout: "BTC" };
+    };
+    const audioTensors = channelsB.map(makeAudioTensor);
+    const layout = audioTensors[0].layout;
+    const stacked = tf.concat(
+      audioTensors.map((x) => x.t),
+      0
+    ); // [B,*,*]
+    audioTensors.forEach((x) => x.t.dispose());
+    const tensorsToDispose = [stacked];
+    const inputsInfo2 = this.model.inputs || [];
+    const minimalInputs = {};
+    if (audioInputInfo?.name) minimalInputs[audioInputInfo.name] = stacked;
+    const matchesComplexInput = (info) =>
+      info &&
+      info.dtype === "complex64" &&
+      Array.isArray(info.shape) &&
+      info.shape.length === 3 &&
+      info.shape[2] === 2 &&
+      info.shape[1] === 2049;
+    const matchesMag4dInput = (info) =>
+      info &&
+      info.dtype === "float32" &&
+      Array.isArray(info.shape) &&
+      info.shape.length === 4 &&
+      info.shape[1] === 512 &&
+      info.shape[2] === 1024 &&
+      info.shape[3] === 2;
+    // Build feature batches if required
+    const haveComplex = inputsInfo2.some(matchesComplexInput);
+    const haveMag = inputsInfo2.some(matchesMag4dInput);
+    try {
+      if (haveComplex || haveMag) {
+        // Use precomputed features if provided; else compute now
+        const feats =
+          opts &&
+          Array.isArray(opts.featuresB) &&
+          opts.featuresB.length === channelsB.length
+            ? opts.featuresB
+            : channelsB.map((ch) => this.precomputeFeatures(ch));
+        if (haveComplex) {
+          const comps = feats.map((f) => {
+            const realT = tf.tensor(f.stftReal, [f.time, 2049, 2], "float32");
+            const imagT = tf.tensor(f.stftImag, [f.time, 2049, 2], "float32");
+            const rs = realT.slice([0, 0, 0], [f.tSpan, 2049, 2]);
+            const is = imagT.slice([0, 0, 0], [f.tSpan, 2049, 2]);
+            const rpad =
+              f.tSpan === 512
+                ? null
+                : tf.zeros([512 - f.tSpan, 2049, 2], "float32");
+            const ipad =
+              f.tSpan === 512
+                ? null
+                : tf.zeros([512 - f.tSpan, 2049, 2], "float32");
+            const r512 = rpad ? tf.concat([rs, rpad], 0) : rs;
+            const i512 = ipad ? tf.concat([is, ipad], 0) : is;
+            realT.dispose();
+            imagT.dispose();
+            rs.dispose();
+            is.dispose();
+            if (rpad) rpad.dispose();
+            if (ipad) ipad.dispose();
+            const c = tf.complex(r512, i512);
+            r512.dispose();
+            i512.dispose();
+            return c; // [512,2049,2] complex
+          });
+          const stftB = tf.concat(
+            comps.map((c) => c.expandDims(0)),
+            0
+          ); // [B,512,2049,2]
+          comps.forEach((c) => c.dispose());
+          tensorsToDispose.push(stftB);
+          for (const info of inputsInfo2) {
+            if (matchesComplexInput(info)) minimalInputs[info.name] = stftB;
+          }
+        }
+        if (haveMag) {
+          const mags = feats.map((f) => {
+            const magT = tf.tensor(f.magArr, [f.time, 1024, 2], "float32");
+            const magSlice = magT.slice([0, 0, 0], [f.tSpan, 1024, 2]);
+            const pad =
+              f.tSpan === 512 ? null : tf.zeros([512 - f.tSpan, 1024, 2]);
+            const patch = pad ? tf.concat([magSlice, pad], 0) : magSlice;
+            magT.dispose();
+            if (pad) pad.dispose();
+            magSlice.dispose();
+            return patch.expandDims(0); // [1,512,1024,2]
+          });
+          const magB = tf.concat(mags, 0); // [B,512,1024,2]
+          mags.forEach((t) => t.dispose());
+          tensorsToDispose.push(magB);
+          for (const info of inputsInfo2) {
+            if (matchesMag4dInput(info)) minimalInputs[info.name] = magB;
+          }
+        }
+      }
+      // Fill other placeholders with zeros/noise
+      for (const info of inputsInfo2) {
+        const name = info?.name;
+        if (!name || minimalInputs[name]) continue;
+        const dtype = info.dtype || "float32";
+        const shape = info.shape || [];
+        const shaped = shape.map((d, idx) =>
+          d == null || d < 0 ? (idx === 0 ? B : 1) : d
+        );
+        let t;
+        if (dtype === "string") {
+          t = tf.fill(shaped, "");
+        } else if (dtype === "complex64") {
+          const r = tf.zeros(shaped, "float32");
+          const i = tf.zeros(shaped, "float32");
+          t = tf.complex(r, i);
+          r.dispose();
+          i.dispose();
+        } else {
+          t = this._fillNonAudioWithNoise
+            ? tf.randomUniform(shaped, -1e-3, 1e-3, "float32")
+            : tf.zeros(
+                shaped,
+                dtype === "float32" || dtype === "int32" || dtype === "bool"
+                  ? dtype
+                  : "float32"
+              );
+        }
+        minimalInputs[name] = t;
+        tensorsToDispose.push(t);
+      }
+      // Execute once
+      const fetches = this._stemOutputNames(this.numStems);
+      let raw = await (this.model.executeAsync
+        ? this.model.executeAsync(minimalInputs, fetches)
+        : this.model.execute
+        ? this.model.execute(minimalInputs, fetches)
+        : this.model.predict(minimalInputs));
+      const outs = Array.isArray(raw)
+        ? raw
+        : raw && raw.dtype
+        ? [raw]
+        : raw && typeof raw === "object"
+        ? Object.values(raw)
+        : [];
+      const numericOuts = outs.filter(
+        (t) => t && typeof t.dtype === "string" && t.dtype !== "string"
+      );
+      // Parse per-batch per-stem
+      const S = this.numStems;
+      const stemsB = [];
+      if (numericOuts.length === S) {
+        // Each output is [B, T, 2] or [B, 2, T] etc. Reduce to mono per batch.
+        const perOutData = await Promise.all(numericOuts.map((t) => t.data()));
+        for (let b = 0; b < B; b++) {
+          const perStem = new Array(S).fill(null);
+          for (let s = 0; s < S; s++) {
+            const t = numericOuts[s];
+            const d = perOutData[s];
+            const shape = t.shape;
+            // Handle [B,T,2] or [B,2,T]
+            if (shape.length === 3 && shape[0] === B) {
+              if (shape[2] === 2) {
+                const Tn = shape[1];
+                const base = b * Tn * 2;
+                const mono = new Float32Array(Tn);
+                for (let tt = 0; tt < Tn; tt++) {
+                  const L = d[base + tt * 2 + 0];
+                  const R = d[base + tt * 2 + 1];
+                  mono[tt] = (L + R) * 0.5;
+                }
+                perStem[s] = mono;
+              } else if (shape[1] === 2) {
+                const Tn = shape[2];
+                // data per batch contiguous by default in TF.js
+                const mono = new Float32Array(Tn);
+                const row = b * 2 * Tn;
+                for (let tt = 0; tt < Tn; tt++) {
+                  const L = d[row + tt];
+                  const R = d[row + Tn + tt];
+                  mono[tt] = (L + R) * 0.5;
+                }
+                perStem[s] = mono;
+              } else {
+                perStem[s] = new Float32Array(firstPrep.T);
+              }
+            } else {
+              perStem[s] = new Float32Array(firstPrep.T);
+            }
+          }
+          stemsB.push(perStem);
+        }
+      } else {
+        // Fallback: per-batch single best output split evenly is non-trivial; fallback to single runs
+        for (let b = 0; b < B; b++) {
+          const single = await this.runChunk(channelsB[b], sampleRate, opts);
+          stemsB.push(single.stems);
+        }
+      }
+      outs.forEach((t) => {
+        try {
+          t && t.dispose && t.dispose();
+        } catch (_) {}
+      });
+      const seen = new Set();
+      tensorsToDispose.forEach((t) => {
+        if (!t || !t.dispose) return;
+        if (seen.has(t)) return;
+        seen.add(t);
+        try {
+          t.dispose();
+        } catch (_) {}
+      });
+      return { stemsB };
+    } catch (e) {
+      // Safe fallback: run singles
+      const stemsB = [];
+      for (let b = 0; b < B; b++) {
+        const single = await this.runChunk(channelsB[b], sampleRate, opts);
+        stemsB.push(single.stems);
+      }
+      return { stemsB };
+    }
   }
 
   async _runChunkInternal(channelsOrMono, sampleRate, opts = {}) {
@@ -297,82 +662,14 @@ export class InferenceEngine {
     }
     // Precompute STFT-based features using fast JS FFT (return raw arrays)
     const computeFeatures = async () => {
-      const backend = tf.getBackend();
-      if (backend === "webgl") {
-        dbg("inference.js:features", "backend=webgl; skipping feature compute");
-        return null;
-      }
-      dbg("inference.js:features", `start (backend=${backend})`);
       const t0 = performance.now();
-      // Compute STFT with custom FFT for up to 2 channels
-      const { channels: st, frames, bins } = stftStereo(prepped, 1024);
-      let time = frames;
-      if (!time || time <= 0) time = 1; // guard against tiny chunks
-      // Build real/imag arrays shaped [frames, bins(2049), 2]
-      const ch0 = st[0];
-      const ch1 = st.length > 1 ? st[1] : st[0];
-      const outBins = 2049; // bins
-      const realArr = new Float32Array(time * outBins * 2);
-      const imagArr = new Float32Array(time * outBins * 2);
-      for (let f = 0; f < time; f++) {
-        const base = f * outBins;
-        for (let k = 0; k < outBins; k++) {
-          const i0 = base + k;
-          const dst = (base + k) * 2;
-          realArr[dst + 0] = ch0?.real?.[i0] ?? 0;
-          realArr[dst + 1] = ch1?.real?.[i0] ?? 0;
-          imagArr[dst + 0] = ch0?.imag?.[i0] ?? 0;
-          imagArr[dst + 1] = ch1?.imag?.[i0] ?? 0;
-        }
-      }
-      // Magnitude patch arrays [time,1024,2] -> later [1,512,1024,2]
-      const magArr = new Float32Array(time * 1024 * 2);
-      for (let f = 0; f < time; f++) {
-        const base = f * outBins;
-        const dstBase = f * 1024 * 2;
-        for (let k = 0; k < 1024; k++) {
-          const i0 = base + k;
-          const r0 = ch0?.real?.[i0] ?? 0;
-          const i0v = ch0?.imag?.[i0] ?? 0;
-          const r1 = ch1?.real?.[i0] ?? 0;
-          const i1v = ch1?.imag?.[i0] ?? 0;
-          // log1p magnitude scaling improves numerical range for models
-          magArr[dstBase + k * 2 + 0] = Math.log1p(Math.hypot(r0, i0v));
-          magArr[dstBase + k * 2 + 1] = Math.log1p(Math.hypot(r1, i1v));
-        }
-      }
-      const tSpan = Math.min(512, time);
-      // JS stats only (no tensors yet)
-      let minv = Infinity,
-        maxv = -Infinity,
-        sum = 0,
-        cnt = 0;
-      for (let i = 0; i < magArr.length; i++) {
-        const v = magArr[i];
-        if (v < minv) minv = v;
-        if (v > maxv) maxv = v;
-        sum += v;
-        cnt++;
-      }
+      const f = this.precomputeFeatures(prepped);
       const t1 = performance.now();
       dbg(
         "inference.js:features",
         `feature compute took ${(t1 - t0).toFixed(2)} ms`
       );
-      dbg(
-        "inference.js:features",
-        `done frames=${time} bins=${outBins} mag stats: min=${minv.toFixed(
-          4
-        )} max=${maxv.toFixed(4)} mean=${(sum / Math.max(1, cnt)).toFixed(6)}`
-      );
-      return {
-        time,
-        outBins,
-        tSpan,
-        stftReal: realArr,
-        stftImag: imagArr,
-        magArr,
-      };
+      return f;
     };
     let features = null;
     const tFeat0 =
@@ -398,7 +695,9 @@ export class InferenceEngine {
 
     const needComplex = (inputsInfo || []).some(matchesComplexInput);
     const needMag4d = (inputsInfo || []).some(matchesMag4dInput);
-    if (needComplex || needMag4d) {
+    if (opts && opts.features) {
+      features = opts.features;
+    } else if (needComplex || needMag4d) {
       try {
         features = await computeFeatures();
       } catch (e) {
@@ -493,9 +792,25 @@ export class InferenceEngine {
           [features.time, 2049, 2],
           "float32"
         );
-        stftStack = tf.complex(realT, imagT);
+        const rs = realT.slice([0, 0, 0], [features.tSpan, 2049, 2]);
+        const is = imagT.slice([0, 0, 0], [features.tSpan, 2049, 2]);
+        const rpad =
+          features.tSpan === 512
+            ? null
+            : tf.zeros([512 - features.tSpan, 2049, 2], "float32");
+        const ipad =
+          features.tSpan === 512
+            ? null
+            : tf.zeros([512 - features.tSpan, 2049, 2], "float32");
+        const r512 = rpad ? tf.concat([rs, rpad], 0) : rs;
+        const i512 = ipad ? tf.concat([is, ipad], 0) : is;
+        stftStack = tf.complex(r512, i512); // [512,2049,2]
         realT.dispose();
         imagT.dispose();
+        rs.dispose();
+        is.dispose();
+        if (rpad) rpad.dispose();
+        if (ipad) ipad.dispose();
         tensorsToDispose.push(stftStack);
         for (const name of complexList) dict[name] = stftStack;
       }
@@ -797,9 +1112,9 @@ export class InferenceEngine {
           }
         }
       }
-      // Restore to CPU after exec if we switched
+      // Restore to CPU after exec if we switched and not sticky
       try {
-        if (triedWebGL) {
+        if (triedWebGL && !opts?.stickyBackend) {
           await tf.setBackend("cpu");
           await tf.ready();
         }
@@ -983,7 +1298,7 @@ export class InferenceEngine {
         }
       }
       try {
-        if (triedWebGL) {
+        if (triedWebGL && !opts?.stickyBackend) {
           await tf.setBackend("cpu");
           await tf.ready();
         }
