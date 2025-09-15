@@ -57,7 +57,7 @@ export async function currentBackend() {
 }
 
 // Apply optional WebGL tuning flags. Unsupported flags are ignored.
-// opts: { precision: 'low'|'high', webglVersion?: 1|2, pack?: boolean }
+// opts: { webglVersion?: 1|2, pack?: boolean }
 export async function applyWebGLTuning(opts = {}) {
   const tf = await ensureTF();
   const safeSet = (key, val) => {
@@ -69,15 +69,9 @@ export async function applyWebGLTuning(opts = {}) {
       return false;
     }
   };
-  const { precision, webglVersion, pack } = opts;
+  const { webglVersion, pack } = opts;
   if (typeof pack === "boolean") safeSet("WEBGL_PACK", pack);
   if (webglVersion === 1 || webglVersion === 2)
     safeSet("WEBGL_VERSION", webglVersion);
-  if (precision === "low") {
-    // Prefer half-float textures to reduce bandwidth; ignore if not supported
-    safeSet("WEBGL_FORCE_F16_TEXTURES", true);
-  } else if (precision === "high") {
-    safeSet("WEBGL_FORCE_F16_TEXTURES", false);
-  }
   return true;
 }

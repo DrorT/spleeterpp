@@ -16,17 +16,18 @@ export function overlapAddStitchMono(outputs, totalFrames, chunkSize, hopSize) {
   const out = new Float32Array(totalFrames);
   const acc = new Float32Array(totalFrames);
   const fade = Math.max(0, chunkSize - hopSize);
-  const half = Math.floor(fade / 2);
   let writePos = 0;
   for (let ci = 0; ci < outputs.length; ci++) {
     const chunk = outputs[ci];
     for (let i = 0; i < chunk.length; i++) {
       const pos = writePos + i;
       if (pos >= totalFrames) break;
+      // Triangular window across the overlap region: ramps up in the first fade samples,
+      // stays 1 in the middle (if any), ramps down in the last fade samples.
       let w = 1.0;
       if (fade > 0) {
-        if (i < half) w = i / half;
-        else if (i > chunk.length - 1 - half) w = (chunk.length - 1 - i) / half;
+        if (i < fade) w = i / fade; // rising edge
+        else if (i >= chunk.length - fade) w = (chunk.length - 1 - i) / fade; // falling edge
         if (w < 0) w = 0;
         if (w > 1) w = 1;
       }

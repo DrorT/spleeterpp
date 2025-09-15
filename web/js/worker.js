@@ -117,14 +117,14 @@ self.onmessage = async (e) => {
           hopSize,
           channels,
           numStems = 2,
-          precision = "auto",
           batchSize = 1,
+          tag: reqTag,
         } = payload;
         const tMsg0 = performance.now();
         const tTotal0 = tMsg0;
         self.postMessage({
           type: "processing-start",
-          payload: { frames, chunkSize, hopSize, numStems },
+          payload: { frames, chunkSize, hopSize, numStems, tag: reqTag },
         });
         const tMsg1 = performance.now();
         if (verbose)
@@ -140,7 +140,7 @@ self.onmessage = async (e) => {
         const tPlan0 = performance.now();
         self.postMessage({
           type: "planned",
-          payload: { total: chunks.length },
+          payload: { total: chunks.length, tag: reqTag },
         });
         const tPlan1 = performance.now();
         if (verbose)
@@ -160,7 +160,8 @@ self.onmessage = async (e) => {
           await engine.load(numStems);
           self._engines.set(numStems, engine);
         }
-        const perStemOutputs = new Array(numStems).fill(null).map(() => []);
+  const perStemOutputs = new Array(numStems).fill(null).map(() => []);
+  let lastBackend = null;
         const progressIntervalMs = Math.max(
           50,
           Number(payload?.progressIntervalMs || 250)
@@ -198,7 +199,6 @@ self.onmessage = async (e) => {
               if (canBatch && k > 1) {
                 try {
                   await engine.runChunks(slicesB, sampleRate, {
-                    precision,
                     stickyBackend: true,
                   });
                 } catch (_) {
@@ -208,10 +208,10 @@ self.onmessage = async (e) => {
               const t0 = performance.now();
               const resB =
                 canBatch && k > 1
-                  ? await engine.runChunks(slicesB, sampleRate, { precision })
+                  ? await engine.runChunks(slicesB, sampleRate, {})
                   : await Promise.all(
                       slicesB.map((slice) =>
-                        engine.runChunk(slice, sampleRate, { precision })
+                        engine.runChunk(slice, sampleRate, {})
                       )
                     ).then((arr) => ({ stemsB: arr.map((r) => r.stems) }));
               const t1 = performance.now();
@@ -221,9 +221,11 @@ self.onmessage = async (e) => {
                 const stems = stemsB[j];
                 for (let s = 0; s < numStems; s++)
                   perStemOutputs[s].push(stems[s]);
+                if (resB?.backend) lastBackend = resB.backend;
                 self.postMessage({
                   type: "progress",
                   payload: {
+                    tag: reqTag,
                     index: idx + j + 1,
                     total: chunks.length,
                     start: c.start,
@@ -291,7 +293,6 @@ self.onmessage = async (e) => {
             let t0 = performance.now();
             try {
               resB = await engine.runChunks(slicesB, sampleRate, {
-                precision,
                 stickyBackend: true,
                 featuresB:
                   nextFeaturesB && nextFeaturesB.length === slicesB.length
@@ -315,12 +316,12 @@ self.onmessage = async (e) => {
                 const slice = slicesB[j];
                 const tS0 = performance.now();
                 const res = await engine.runChunk(slice, sampleRate, {
-                  precision,
                   stickyBackend: true,
                 });
                 const tS1 = performance.now();
                 for (let s = 0; s < numStems; s++)
                   perStemOutputs[s].push(res.stems[s]);
+                if (res?.backend) lastBackend = res.backend;
                 self.postMessage({
                   type: "progress",
                   payload: {
@@ -353,6 +354,7 @@ self.onmessage = async (e) => {
                 self.postMessage({
                   type: "progress",
                   payload: {
+                    tag: reqTag,
                     index: i + j + 1,
                     total: chunks.length,
                     start: c.start,
@@ -385,7 +387,6 @@ self.onmessage = async (e) => {
             const nextFeatPromise = nextSlice ? precompute(nextSlice) : null;
             let t0 = performance.now();
             const result = await engine.runChunk(slice, sampleRate, {
-              precision,
               stickyBackend: true,
               features: nextFeaturesB || (await nextFeatPromise),
             });
@@ -393,6 +394,7 @@ self.onmessage = async (e) => {
             nextFeaturesB = null;
             for (let s = 0; s < numStems; s++)
               perStemOutputs[s].push(result.stems[s]);
+            if (result?.backend) lastBackend = result.backend;
             await new Promise((r) => setTimeout(r, 0));
             const now = performance.now();
             if (
@@ -403,6 +405,7 @@ self.onmessage = async (e) => {
               self.postMessage({
                 type: "progress",
                 payload: {
+                  tag: reqTag,
                   index: i + 1,
                   total: chunks.length,
                   start: c.start,
@@ -451,15 +454,51 @@ self.onmessage = async (e) => {
           return { len: n, min, max, rms, nzFrac };
         };
         const stats = stitched.map((a) => computeStats(a));
+        // Reconstruction metric: how close is sum(stems) to original mono mix
+        const computeRecon = (stems, channels) => {
+          try {
+            const n = Math.min(
+              channels && channels.length ? channels[0].length : 0,
+              stems && stems.length ? stems[0].length : 0
+            );
+            if (!n) return null;
+            const stride = n > 200000 ? Math.ceil(n / 200000) : 1;
+            let sumSq = 0;
+            let sumSqMix = 0;
+            let count = 0;
+            const C = Math.max(1, channels.length || 0);
+            for (let i = 0; i < n; i += stride) {
+              let mix = 0;
+              for (let c = 0; c < C; c++) mix += channels[c][i] || 0;
+              mix /= C;
+              let sumS = 0;
+              for (let s = 0; s < stems.length; s++) sumS += stems[s][i] || 0;
+              const d = sumS - mix;
+              sumSq += d * d;
+              sumSqMix += mix * mix;
+              count++;
+            }
+            const rmsDiff = Math.sqrt(sumSq / Math.max(1, count));
+            const rmsMix = Math.sqrt(sumSqMix / Math.max(1, count));
+            const relPct = rmsMix > 1e-12 ? (rmsDiff / rmsMix) * 100 : 0;
+            return { rmsDiff, rmsMix, relPct, samples: count };
+          } catch (_) {
+            return null;
+          }
+        };
+        const recon = computeRecon(stitched, channels);
         const tDone0 = performance.now();
         const transfer = stitched.map((a) => a.buffer);
         self.postMessage(
           {
             type: "done",
             payload: {
+              tag: reqTag,
               stems: stitched,
               sampleRate,
               stats,
+              recon,
+              backend: lastBackend,
               totalMs: tDone0 - tTotal0,
             },
           },
@@ -476,9 +515,10 @@ self.onmessage = async (e) => {
             },
           });
       } catch (err) {
+        const ep = makeErrorPayload(err, "process-audio");
         self.postMessage({
           type: "error",
-          payload: makeErrorPayload(err, "process-audio"),
+          payload: { ...ep, tag: payload?.tag },
         });
       }
       return;

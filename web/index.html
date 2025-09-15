@@ -10,6 +10,7 @@
     <div>
       <input id="fileInput" type="file" accept="audio/*" />
       <button id="cancelBtn" disabled>Cancel</button>
+      <button id="startBtn" disabled>Start Separation</button>
     </div>
     <div style="margin-top: 8px">
       <label for="stemsSelect">Stems:</label>
@@ -20,6 +21,8 @@
       </select>
       <button id="loadModelBtn">Load Model</button>
       <button id="preloadAllBtn">Preload All</button>
+      <span id="gpuStatus" style="margin-left: 12px; color: #666">GPU: checking…</span>
+      <span id="backendStatus" style="margin-left: 12px; color: #666">Backend: —</span>
       <label style="margin-left: 12px"
         ><input type="checkbox" id="verboseChk" /> Verbose logs</label
       >
@@ -44,14 +47,6 @@
           style="width: 70px"
       /></label>
       <label style="margin-left: 12px"
-        >Precision:
-        <select id="precisionSelect">
-          <option value="auto" selected>auto</option>
-          <option value="low">low (F16)</option>
-          <option value="high">high (F32)</option>
-        </select>
-      </label>
-      <label style="margin-left: 12px"
         >Batch:
         <select id="batchSize" style="width: 80px">
           <option value="auto" selected>auto</option>
@@ -61,11 +56,20 @@
           <option value="4">4</option>
         </select>
       </label>
+      <span style="margin-left: 12px; border-left: 1px solid #ccc; padding-left: 12px">
+        <label>A/B chunks (s):
+          <input id="abA" type="number" min="2" max="60" value="10" style="width:60px" />
+          <input id="abB" type="number" min="2" max="60" value="20" style="width:60px" />
+        </label>
+        <label style="margin-left:8px"><input id="abAlignHop" type="checkbox" /> Align hop (fair compare)</label>
+        <button id="abBtn">Run A/B Compare</button>
+      </span>
     </div>
     <pre id="log">Loading...</pre>
     <script type="module">
       // import { createSpleeterWasm } from "./js/spleeter-wasm.js";
       import { resampleTo44100, decodeArrayBufferToPCM } from "./js/audio.js";
+      import { checkGPUSupport } from "./js/tf-backend.js";
 
       const logEl = document.getElementById("log");
       const verboseChk = document.getElementById("verboseChk");
@@ -95,11 +99,25 @@
       const cancelBtn = document.getElementById("cancelBtn");
       const stemsSelect = document.getElementById("stemsSelect");
       const loadModelBtn = document.getElementById("loadModelBtn");
-      const preloadAllBtn = document.getElementById("preloadAllBtn");
+  const preloadAllBtn = document.getElementById("preloadAllBtn");
+  const startBtn = document.getElementById("startBtn");
 
-      const workerUrl = new URL("./js/worker.js", import.meta.url);
+  const workerUrl = new URL("./js/worker.js", import.meta.url);
       const worker = new Worker(workerUrl, { type: "module" });
       log("Worker created (module)");
+      // Probe GPU/WebGL support and update UI
+      (async () => {
+        try {
+          const ok = await checkGPUSupport();
+          const gpuEl = document.getElementById("gpuStatus");
+          if (gpuEl) gpuEl.textContent = ok ? "GPU: WebGL available" : "GPU: CPU only";
+          log(`[ui] GPU/WebGL available: ${ok ? "yes" : "no"}`);
+        } catch (e) {
+          const gpuEl = document.getElementById("gpuStatus");
+          if (gpuEl) gpuEl.textContent = "GPU: probe failed";
+          log("[ui] GPU probe failed");
+        }
+      })();
       worker.addEventListener("error", (ev) => {
         const where =
           ev && ev.filename
@@ -141,6 +159,9 @@
         progressRAF = false;
       };
 
+      // A/B compare state
+      const abState = { active: false, tags: {}, results: {} };
+
       worker.onmessage = async (e) => {
         const { type, payload } = e.data || {};
         if (type === "worker-ready") {
@@ -170,11 +191,12 @@
           log("Preloading models...");
         } else if (type === "processing-start") {
           log(
-            `Processing: frames=${payload.frames}, chunk=${payload.chunkSize}, hop=${payload.hopSize}, stems=${payload.numStems}`
+            `Processing: frames=${payload.frames}, chunk=${payload.chunkSize}, hop=${payload.hopSize}, stems=${payload.numStems}` +
+              (payload?.tag ? ` [tag=${payload.tag}]` : "")
           );
         } else if (type === "planned") {
           cancelBtn.disabled = false;
-          log(`Planned ${payload.total} chunks...`);
+          log(`Planned ${payload.total} chunks...` + (payload?.tag ? ` [tag=${payload.tag}]` : ""));
         } else if (type === "progress") {
           pendingProgress = payload;
           if (!progressRAF) {
@@ -182,11 +204,22 @@
             requestAnimationFrame(flushProgress);
           }
         } else if (type === "cancelled") {
+          if (payload?.recon) {
+            const r = payload.recon;
+            log(
+              `Recon error: rmsDiff=${r.rmsDiff.toExponential(3)} (${r.relPct.toFixed(2)}% of input rms ${r.rmsMix.toExponential(3)})`
+            );
+          }
           cancelBtn.disabled = true;
           log("Cancelled");
         } else if (type === "done") {
           cancelBtn.disabled = true;
-          log("Done");
+          log("Done" + (payload?.tag ? ` [tag=${payload.tag}]` : ""));
+          if (payload?.backend) {
+            log(`Backend used: ${payload.backend}`);
+            const be = document.getElementById("backendStatus");
+            if (be) be.textContent = `Backend: ${payload.backend}`;
+          }
           if (payload?.totalMs != null) {
             const sec = (payload.totalMs / 1000).toFixed(2);
             log(`Total: ${sec}s end-to-end`);
@@ -201,6 +234,59 @@
                 ).toFixed(2)}%`
               )
             );
+          }
+          // If A/B active, collect and compare when both arrive
+          if (abState.active && payload?.tag && (payload.tag === "A" || payload.tag === "B")) {
+            abState.results[payload.tag] = payload;
+            if (abState.results.A && abState.results.B) {
+              const A = abState.results.A;
+              const B = abState.results.B;
+              const stemsA = A.stems || [];
+              const stemsB = B.stems || [];
+              const n = Math.min(stemsA.length, stemsB.length);
+              log(`A/B compare: stems=${n}`);
+              for (let i = 0; i < n; i++) {
+                const a = stemsA[i];
+                const b = stemsB[i];
+                const len = Math.min(a.length, b.length);
+                let sumSq = 0;
+                let sumSqA = 0;
+                let sumSqB = 0;
+                const stride = len > 200000 ? Math.ceil(len / 200000) : 1;
+                for (let j = 0; j < len; j += stride) {
+                  const da = a[j];
+                  const db = b[j];
+                  const d = da - db;
+                  sumSq += d * d;
+                  sumSqA += da * da;
+                  sumSqB += db * db;
+                }
+                const rmsDiff = Math.sqrt(sumSq / Math.max(1, Math.ceil(len / stride)));
+                const rmsA = Math.sqrt(sumSqA / Math.max(1, Math.ceil(len / stride)));
+                const rmsB = Math.sqrt(sumSqB / Math.max(1, Math.ceil(len / stride)));
+                const relA = rmsA > 1e-9 ? (rmsDiff / rmsA) * 100 : 0;
+                const relB = rmsB > 1e-9 ? (rmsDiff / rmsB) * 100 : 0;
+                log(`Stem ${i + 1} RMS diff: ${rmsDiff.toExponential(3)} (${relA.toFixed(2)}% of A, ${relB.toFixed(2)}% of B)`);
+              }
+              if (A.recon || B.recon) {
+                const ra = A.recon;
+                const rb = B.recon;
+                if (ra)
+                  log(
+                    `A recon: rmsDiff=${ra.rmsDiff.toExponential(3)} (${ra.relPct.toFixed(2)}% of input)`
+                  );
+                if (rb)
+                  log(
+                    `B recon: rmsDiff=${rb.rmsDiff.toExponential(3)} (${rb.relPct.toFixed(2)}% of input)`
+                  );
+              }
+              log(`A time: ${(A.totalMs / 1000).toFixed(2)}s, B time: ${(B.totalMs / 1000).toFixed(2)}s`);
+              if (A.backend || B.backend) {
+                log(`A backend: ${A.backend || "?"}, B backend: ${B.backend || "?"}`);
+              }
+              abState.active = false;
+              abState.results = {};
+            }
           }
           // Quick listen: play first stem mono
           try {
@@ -268,10 +354,58 @@
         } else if (type === "error") {
           cancelBtn.disabled = true;
           if (payload?.site) log(`Error at ${payload.site}`);
-          log("Error: " + payload.message);
+          log("Error: " + payload.message + (payload?.tag ? ` [tag=${payload.tag}]` : ""));
           if (payload?.context) log(`Context: ${payload.context}`);
           if (payload?.stack) log(payload.stack);
         }
+      };
+      // Run A/B compare: runs two process-audio with different chunk sizes and compares RMS
+      const abBtn = document.getElementById("abBtn");
+      abBtn.onclick = async () => {
+        const f = fileInput.files && fileInput.files[0];
+        if (!f) {
+          log("Select a file first for A/B compare");
+          return;
+        }
+        const abA = Math.max(2, Math.min(60, Number(document.getElementById("abA").value) || 10));
+        const abB = Math.max(2, Math.min(60, Number(document.getElementById("abB").value) || 20));
+        log(`A/B: A=${abA}s, B=${abB}s`);
+        // Reuse already decoded+resampled audio if available by caching it on window
+        if (!window._lastPCM || window._lastPCMFile !== f) {
+          const abuf = await f.arrayBuffer();
+          const pcm = await decodeArrayBufferToPCM(abuf);
+          window._lastPCM = await resampleTo44100(pcm);
+          window._lastPCMFile = f;
+        }
+        const resampled = window._lastPCM;
+        const frames = resampled.channels?.[0]?.length || 0;
+        const stems = Number(stemsSelect.value);
+        const progressIntervalMs = Number(document.getElementById("progressMs").value) || 250;
+        const batchSize = document.getElementById("batchSize").value || "auto";
+        abState.active = true;
+        abState.results = {};
+        // Kick A then B
+        const send = (tag, chunkSec) => {
+          const chunkSize = Math.max(1, Math.floor(44100 * chunkSec));
+          const alignHop = !!document.getElementById("abAlignHop").checked;
+          const hopSize = alignHop ? Math.floor((44100 * Math.min(abA, abB)) / 2) : Math.floor(chunkSize / 2);
+          worker.postMessage({
+            type: "process-audio",
+            payload: {
+              tag,
+              sampleRate: 44100,
+              frames,
+              chunkSize,
+              hopSize,
+              channels: resampled.channels,
+              numStems: stems,
+              progressIntervalMs,
+              batchSize,
+            },
+          });
+        };
+        send("A", abA);
+        send("B", abB);
       };
 
       loadModelBtn.onclick = () => {
@@ -313,6 +447,10 @@
           const ab = await f.arrayBuffer();
           const pcm = await decodeArrayBufferToPCM(ab);
           const resampled = await resampleTo44100(pcm);
+          // Cache for later processing
+          window._lastPCM = resampled;
+          window._lastPCMFile = f;
+          startBtn.disabled = false;
           // Log input stats
           const statsCh = (arr) => {
             const n = arr.length;
@@ -357,18 +495,30 @@
               ).toFixed(2)}%`
             );
           }
+          log("Ready. Click 'Start Separation' to run.");
+        };
+
+        // Start processing using cached audio and current UI settings
+        startBtn.onclick = async () => {
+          const f = fileInput.files && fileInput.files[0];
+          if (!f) {
+            log("Select a file first.");
+            return;
+          }
+          if (!window._lastPCM || window._lastPCMFile !== f) {
+            const ab = await f.arrayBuffer();
+            const pcm = await decodeArrayBufferToPCM(ab);
+            window._lastPCM = await resampleTo44100(pcm);
+            window._lastPCMFile = f;
+          }
+          const resampled = window._lastPCM;
           const frames = resampled.channels?.[0]?.length || 0;
-          const chunkSec =
-            Number(document.getElementById("chunkSec").value) || 10;
+          const chunkSec = Number(document.getElementById("chunkSec").value) || 10;
           const chunkSize = Math.max(1, Math.floor(44100 * chunkSec));
-          const hopSize = Math.floor(chunkSize / 2); // 50% overlap
+          const hopSize = Math.floor(chunkSize / 2);
           const stems = Number(stemsSelect.value);
-          const progressIntervalMs =
-            Number(document.getElementById("progressMs").value) || 250;
-          const precision =
-            document.getElementById("precisionSelect").value || "auto";
-          const batchSize =
-            document.getElementById("batchSize").value || "auto";
+          const progressIntervalMs = Number(document.getElementById("progressMs").value) || 250;
+          const batchSize = document.getElementById("batchSize").value || "auto";
           worker.postMessage({
             type: "process-audio",
             payload: {
@@ -379,7 +529,6 @@
               channels: resampled.channels,
               numStems: stems,
               progressIntervalMs,
-              precision,
               batchSize,
             },
           });

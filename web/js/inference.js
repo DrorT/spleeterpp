@@ -1,5 +1,5 @@
 // Inference adapter for TF.js models (model loading + inference)
-import { ensureTF, configureBackend, applyWebGLTuning } from "./tf-backend.js";
+import { ensureTF, configureBackend } from "./tf-backend.js";
 import { loadGraphModelWithCache } from "./model-loader.js";
 import { stftStereo } from "./fft4096.js";
 
@@ -92,7 +92,7 @@ export class InferenceEngine {
     const channels = Array.isArray(channelsOrMono)
       ? channelsOrMono
       : [channelsOrMono];
-    const { channels: st, frames, bins } = stftStereo(channels, 1024);
+  const { channels: st, frames, bins } = stftStereo(channels, 1024, 512);
     let time = frames;
     if (!time || time <= 0) time = 1;
     const outBins = 2049;
@@ -150,8 +150,9 @@ export class InferenceEngine {
       return { stemsB: [] };
     // Fallback to single if model missing
     if (!this.model) {
-      const single = await this.runChunk(channelsB[0], sampleRate, opts);
-      return { stemsB: [single.stems] };
+  const single = await this.runChunk(channelsB[0], sampleRate, opts);
+  this._lastExecBackend = single.backend || this._lastExecBackend;
+  return { stemsB: [single.stems], backend: this._lastExecBackend };
     }
     const B = channelsB.length;
     // Probe input layout from first sample using runChunk logic up to tensor creation
@@ -430,7 +431,7 @@ export class InferenceEngine {
           t.dispose();
         } catch (_) {}
       });
-      return { stemsB };
+  return { stemsB, backend: this._lastExecBackend };
     } catch (e) {
       // Safe fallback: run singles
       const stemsB = [];
@@ -438,13 +439,12 @@ export class InferenceEngine {
         const single = await this.runChunk(channelsB[b], sampleRate, opts);
         stemsB.push(single.stems);
       }
-      return { stemsB };
+    return { stemsB, backend: this._lastExecBackend };
     }
   }
 
   async _runChunkInternal(channelsOrMono, sampleRate, opts = {}) {
-    const tf = await ensureTF();
-    const precision = opts?.precision || "auto";
+  const tf = await ensureTF();
     const tAll0 =
       typeof performance !== "undefined" && performance.now
         ? performance.now()
@@ -953,14 +953,9 @@ export class InferenceEngine {
         typeof performance !== "undefined" && performance.now
           ? performance.now()
           : Date.now();
-      let triedWebGL = false;
-      let execBackend = tf.getBackend();
+  let triedWebGL = false;
+  let execBackend = tf.getBackend();
       const prevBackend = execBackend;
-      // Apply precision tuning if requested
-      try {
-        if (precision === "low") await applyWebGLTuning({ precision: "low" });
-        if (precision === "high") await applyWebGLTuning({ precision: "high" });
-      } catch (_) {}
       // Try switch to WebGL just for model execution
       try {
         if (prevBackend !== "webgl") {
@@ -980,12 +975,8 @@ export class InferenceEngine {
             triedWebGL = true;
             execBackend = "webgl";
             try {
-              const fp =
-                tf.backend() &&
-                typeof tf.backend().floatPrecision === "function"
-                  ? tf.backend().floatPrecision()
-                  : undefined;
-              dbg("inference.js:exec", `webgl active; floatPrecision=${fp}`);
+              // Log active backend
+              dbg("inference.js:exec", `webgl active`);
             } catch (_) {}
           } else {
             dbg(
@@ -1033,7 +1024,6 @@ export class InferenceEngine {
               ex && ex.message ? ex.message : ex
             }`
           );
-          // If WebGL failed, fall back to CPU
           if (triedWebGL) {
             try {
               await tf.setBackend("cpu");
@@ -1123,6 +1113,7 @@ export class InferenceEngine {
         typeof performance !== "undefined" && performance.now
           ? performance.now()
           : Date.now();
+      this._lastExecBackend = execBackend;
       dbg(
         "inference.js:timing",
         `model exec (${usedPath}, backend=${execBackend}): ${(
@@ -1151,8 +1142,8 @@ export class InferenceEngine {
         typeof performance !== "undefined" && performance.now
           ? performance.now()
           : Date.now();
-      let triedWebGL = false;
-      let execBackend = tf.getBackend();
+  let triedWebGL = false;
+  let execBackend = tf.getBackend();
       const prevBackend = execBackend;
       try {
         if (prevBackend !== "webgl") {
@@ -1307,6 +1298,7 @@ export class InferenceEngine {
         typeof performance !== "undefined" && performance.now
           ? performance.now()
           : Date.now();
+      this._lastExecBackend = execBackend;
       dbg(
         "inference.js:timing",
         `model exec (${usedPath}, backend=${execBackend}): ${(
@@ -1554,6 +1546,6 @@ export class InferenceEngine {
       "inference.js:timing",
       `runChunk total: ${(tAll1 - tAll0).toFixed(2)} ms`
     );
-    return { stems };
+    return { stems, backend: this._lastExecBackend };
   }
 }
