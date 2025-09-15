@@ -334,10 +334,10 @@ self.onmessage = async (e) => {
           } catch (_) {}
           return null;
         };
-  // Precompute features for upcoming groups (prefetch depth)
-  let nextFeaturesB = null;
-  let firstBatchLogged = false;
-  const PREFETCH_DEPTH = 2;
+        // Precompute features for upcoming groups (prefetch depth)
+        let nextFeaturesB = null;
+        let firstBatchLogged = false;
+        const PREFETCH_DEPTH = 2;
         // Determine dynamic receptive field in samples (framesSpan * hopSamples)
         const getFramesSpan = () => {
           try {
@@ -431,7 +431,8 @@ self.onmessage = async (e) => {
               w[0] = 1;
               return w;
             }
-            for (let i = 0; i < n; i++) w[i] = 0.5 * (1 - Math.cos((2 * Math.PI * i) / (n - 1)));
+            for (let i = 0; i < n; i++)
+              w[i] = 0.5 * (1 - Math.cos((2 * Math.PI * i) / (n - 1)));
             return w;
           };
           for (let pi = 0; pi < parts.length; pi++) {
@@ -546,7 +547,11 @@ self.onmessage = async (e) => {
             if (verbose)
               self.postMessage({
                 type: "debug",
-                payload: { message: `[worker] batched group time ${(t1 - t0).toFixed(1)} ms` },
+                payload: {
+                  message: `[worker] batched group time ${(t1 - t0).toFixed(
+                    1
+                  )} ms`,
+                },
               });
             // Resolve next features after execute completes
             nextFeaturesB = nextFeatPromise ? await nextFeatPromise : null;

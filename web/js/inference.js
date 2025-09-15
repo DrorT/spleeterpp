@@ -142,13 +142,12 @@ export class InferenceEngine {
     let t = this._zeroPadCache.get(key);
     if (t && !t.isDisposedInternal) return t;
     // Lazily create and cache
-    const tf = (
+    const tf =
       typeof window !== "undefined" && window.tf
-    )
-      ? window.tf
-      : (typeof self !== "undefined" && self.tf)
-      ? self.tf
-      : null;
+        ? window.tf
+        : typeof self !== "undefined" && self.tf
+        ? self.tf
+        : null;
     if (!tf) throw new Error("TF.js not initialized for zero pad");
     t = tf.zeros([len, bins, ch], "float32");
     this._zeroPadCache.set(key, t);
@@ -287,7 +286,10 @@ export class InferenceEngine {
             const rs = realT.slice([0, 0, 0], [f.tSpan, 2049, 2]);
             const is = imagT.slice([0, 0, 0], [f.tSpan, 2049, 2]);
             const needPad = 512 - f.tSpan;
-            const rpad = needPad > 0 ? this._getZeroPad(needPad, 2049, 2, "complex") : null;
+            const rpad =
+              needPad > 0
+                ? this._getZeroPad(needPad, 2049, 2, "complex")
+                : null;
             const ipad = needPad > 0 ? rpad : null; // reuse same zeros
             const r512 = rpad ? tf.concat([rs, rpad], 0) : rs;
             const i512 = ipad ? tf.concat([is, ipad], 0) : is;
@@ -316,7 +318,8 @@ export class InferenceEngine {
             const magT = tf.tensor(f.magArr, [f.time, 1024, 2], "float32");
             const magSlice = magT.slice([0, 0, 0], [f.tSpan, 1024, 2]);
             const needPad = 512 - f.tSpan;
-            const pad = needPad > 0 ? this._getZeroPad(needPad, 1024, 2, "mag") : null;
+            const pad =
+              needPad > 0 ? this._getZeroPad(needPad, 1024, 2, "mag") : null;
             const patch = pad ? tf.concat([magSlice, pad], 0) : magSlice;
             magT.dispose();
             // cached pad persists
