@@ -21,8 +21,12 @@
       </select>
       <button id="loadModelBtn">Load Model</button>
       <button id="preloadAllBtn">Preload All</button>
-      <span id="gpuStatus" style="margin-left: 12px; color: #666">GPU: checking…</span>
-      <span id="backendStatus" style="margin-left: 12px; color: #666">Backend: —</span>
+      <span id="gpuStatus" style="margin-left: 12px; color: #666"
+        >GPU: checking…</span
+      >
+      <span id="backendStatus" style="margin-left: 12px; color: #666"
+        >Backend: —</span
+      >
       <label style="margin-left: 12px"
         ><input type="checkbox" id="verboseChk" /> Verbose logs</label
       >
@@ -56,12 +60,36 @@
           <option value="4">4</option>
         </select>
       </label>
-      <span style="margin-left: 12px; border-left: 1px solid #ccc; padding-left: 12px">
-        <label>A/B chunks (s):
-          <input id="abA" type="number" min="2" max="60" value="10" style="width:60px" />
-          <input id="abB" type="number" min="2" max="60" value="20" style="width:60px" />
+      <span
+        style="
+          margin-left: 12px;
+          border-left: 1px solid #ccc;
+          padding-left: 12px;
+        "
+      >
+        <label
+          >A/B chunks (s):
+          <input
+            id="abA"
+            type="number"
+            min="2"
+            max="60"
+            value="10"
+            style="width: 60px"
+          />
+          <input
+            id="abB"
+            type="number"
+            min="2"
+            max="60"
+            value="20"
+            style="width: 60px"
+          />
         </label>
-        <label style="margin-left:8px"><input id="abAlignHop" type="checkbox" /> Align hop (fair compare)</label>
+        <label style="margin-left: 8px"
+          ><input id="abAlignHop" type="checkbox" /> Align hop (fair
+          compare)</label
+        >
         <button id="abBtn">Run A/B Compare</button>
       </span>
     </div>
@@ -99,10 +127,10 @@
       const cancelBtn = document.getElementById("cancelBtn");
       const stemsSelect = document.getElementById("stemsSelect");
       const loadModelBtn = document.getElementById("loadModelBtn");
-  const preloadAllBtn = document.getElementById("preloadAllBtn");
-  const startBtn = document.getElementById("startBtn");
+      const preloadAllBtn = document.getElementById("preloadAllBtn");
+      const startBtn = document.getElementById("startBtn");
 
-  const workerUrl = new URL("./js/worker.js", import.meta.url);
+      const workerUrl = new URL("./js/worker.js", import.meta.url);
       const worker = new Worker(workerUrl, { type: "module" });
       log("Worker created (module)");
       // Probe GPU/WebGL support and update UI
@@ -110,7 +138,8 @@
         try {
           const ok = await checkGPUSupport();
           const gpuEl = document.getElementById("gpuStatus");
-          if (gpuEl) gpuEl.textContent = ok ? "GPU: WebGL available" : "GPU: CPU only";
+          if (gpuEl)
+            gpuEl.textContent = ok ? "GPU: WebGL available" : "GPU: CPU only";
           log(`[ui] GPU/WebGL available: ${ok ? "yes" : "no"}`);
         } catch (e) {
           const gpuEl = document.getElementById("gpuStatus");
@@ -196,7 +225,10 @@
           );
         } else if (type === "planned") {
           cancelBtn.disabled = false;
-          log(`Planned ${payload.total} chunks...` + (payload?.tag ? ` [tag=${payload.tag}]` : ""));
+          log(
+            `Planned ${payload.total} chunks...` +
+              (payload?.tag ? ` [tag=${payload.tag}]` : "")
+          );
         } else if (type === "progress") {
           pendingProgress = payload;
           if (!progressRAF) {
@@ -207,7 +239,11 @@
           if (payload?.recon) {
             const r = payload.recon;
             log(
-              `Recon error: rmsDiff=${r.rmsDiff.toExponential(3)} (${r.relPct.toFixed(2)}% of input rms ${r.rmsMix.toExponential(3)})`
+              `Recon error: rmsDiff=${r.rmsDiff.toExponential(
+                3
+              )} (${r.relPct.toFixed(2)}% of input rms ${r.rmsMix.toExponential(
+                3
+              )})`
             );
           }
           cancelBtn.disabled = true;
@@ -236,7 +272,11 @@
             );
           }
           // If A/B active, collect and compare when both arrive
-          if (abState.active && payload?.tag && (payload.tag === "A" || payload.tag === "B")) {
+          if (
+            abState.active &&
+            payload?.tag &&
+            (payload.tag === "A" || payload.tag === "B")
+          ) {
             abState.results[payload.tag] = payload;
             if (abState.results.A && abState.results.B) {
               const A = abState.results.A;
@@ -261,28 +301,50 @@
                   sumSqA += da * da;
                   sumSqB += db * db;
                 }
-                const rmsDiff = Math.sqrt(sumSq / Math.max(1, Math.ceil(len / stride)));
-                const rmsA = Math.sqrt(sumSqA / Math.max(1, Math.ceil(len / stride)));
-                const rmsB = Math.sqrt(sumSqB / Math.max(1, Math.ceil(len / stride)));
+                const rmsDiff = Math.sqrt(
+                  sumSq / Math.max(1, Math.ceil(len / stride))
+                );
+                const rmsA = Math.sqrt(
+                  sumSqA / Math.max(1, Math.ceil(len / stride))
+                );
+                const rmsB = Math.sqrt(
+                  sumSqB / Math.max(1, Math.ceil(len / stride))
+                );
                 const relA = rmsA > 1e-9 ? (rmsDiff / rmsA) * 100 : 0;
                 const relB = rmsB > 1e-9 ? (rmsDiff / rmsB) * 100 : 0;
-                log(`Stem ${i + 1} RMS diff: ${rmsDiff.toExponential(3)} (${relA.toFixed(2)}% of A, ${relB.toFixed(2)}% of B)`);
+                log(
+                  `Stem ${i + 1} RMS diff: ${rmsDiff.toExponential(
+                    3
+                  )} (${relA.toFixed(2)}% of A, ${relB.toFixed(2)}% of B)`
+                );
               }
               if (A.recon || B.recon) {
                 const ra = A.recon;
                 const rb = B.recon;
                 if (ra)
                   log(
-                    `A recon: rmsDiff=${ra.rmsDiff.toExponential(3)} (${ra.relPct.toFixed(2)}% of input)`
+                    `A recon: rmsDiff=${ra.rmsDiff.toExponential(
+                      3
+                    )} (${ra.relPct.toFixed(2)}% of input)`
                   );
                 if (rb)
                   log(
-                    `B recon: rmsDiff=${rb.rmsDiff.toExponential(3)} (${rb.relPct.toFixed(2)}% of input)`
+                    `B recon: rmsDiff=${rb.rmsDiff.toExponential(
+                      3
+                    )} (${rb.relPct.toFixed(2)}% of input)`
                   );
               }
-              log(`A time: ${(A.totalMs / 1000).toFixed(2)}s, B time: ${(B.totalMs / 1000).toFixed(2)}s`);
+              log(
+                `A time: ${(A.totalMs / 1000).toFixed(2)}s, B time: ${(
+                  B.totalMs / 1000
+                ).toFixed(2)}s`
+              );
               if (A.backend || B.backend) {
-                log(`A backend: ${A.backend || "?"}, B backend: ${B.backend || "?"}`);
+                log(
+                  `A backend: ${A.backend || "?"}, B backend: ${
+                    B.backend || "?"
+                  }`
+                );
               }
               abState.active = false;
               abState.results = {};
@@ -354,7 +416,11 @@
         } else if (type === "error") {
           cancelBtn.disabled = true;
           if (payload?.site) log(`Error at ${payload.site}`);
-          log("Error: " + payload.message + (payload?.tag ? ` [tag=${payload.tag}]` : ""));
+          log(
+            "Error: " +
+              payload.message +
+              (payload?.tag ? ` [tag=${payload.tag}]` : "")
+          );
           if (payload?.context) log(`Context: ${payload.context}`);
           if (payload?.stack) log(payload.stack);
         }
@@ -367,8 +433,14 @@
           log("Select a file first for A/B compare");
           return;
         }
-        const abA = Math.max(2, Math.min(60, Number(document.getElementById("abA").value) || 10));
-        const abB = Math.max(2, Math.min(60, Number(document.getElementById("abB").value) || 20));
+        const abA = Math.max(
+          2,
+          Math.min(60, Number(document.getElementById("abA").value) || 10)
+        );
+        const abB = Math.max(
+          2,
+          Math.min(60, Number(document.getElementById("abB").value) || 20)
+        );
         log(`A/B: A=${abA}s, B=${abB}s`);
         // Reuse already decoded+resampled audio if available by caching it on window
         if (!window._lastPCM || window._lastPCMFile !== f) {
@@ -380,7 +452,8 @@
         const resampled = window._lastPCM;
         const frames = resampled.channels?.[0]?.length || 0;
         const stems = Number(stemsSelect.value);
-        const progressIntervalMs = Number(document.getElementById("progressMs").value) || 250;
+        const progressIntervalMs =
+          Number(document.getElementById("progressMs").value) || 250;
         const batchSize = document.getElementById("batchSize").value || "auto";
         abState.active = true;
         abState.results = {};
@@ -388,7 +461,9 @@
         const send = (tag, chunkSec) => {
           const chunkSize = Math.max(1, Math.floor(44100 * chunkSec));
           const alignHop = !!document.getElementById("abAlignHop").checked;
-          const hopSize = alignHop ? Math.floor((44100 * Math.min(abA, abB)) / 2) : Math.floor(chunkSize / 2);
+          const hopSize = alignHop
+            ? Math.floor((44100 * Math.min(abA, abB)) / 2)
+            : Math.floor(chunkSize / 2);
           worker.postMessage({
             type: "process-audio",
             payload: {
@@ -513,12 +588,15 @@
           }
           const resampled = window._lastPCM;
           const frames = resampled.channels?.[0]?.length || 0;
-          const chunkSec = Number(document.getElementById("chunkSec").value) || 10;
+          const chunkSec =
+            Number(document.getElementById("chunkSec").value) || 10;
           const chunkSize = Math.max(1, Math.floor(44100 * chunkSec));
           const hopSize = Math.floor(chunkSize / 2);
           const stems = Number(stemsSelect.value);
-          const progressIntervalMs = Number(document.getElementById("progressMs").value) || 250;
-          const batchSize = document.getElementById("batchSize").value || "auto";
+          const progressIntervalMs =
+            Number(document.getElementById("progressMs").value) || 250;
+          const batchSize =
+            document.getElementById("batchSize").value || "auto";
           worker.postMessage({
             type: "process-audio",
             payload: {

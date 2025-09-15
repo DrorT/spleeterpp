@@ -160,8 +160,8 @@ self.onmessage = async (e) => {
           await engine.load(numStems);
           self._engines.set(numStems, engine);
         }
-  const perStemOutputs = new Array(numStems).fill(null).map(() => []);
-  let lastBackend = null;
+        const perStemOutputs = new Array(numStems).fill(null).map(() => []);
+        let lastBackend = null;
         const progressIntervalMs = Math.max(
           50,
           Number(payload?.progressIntervalMs || 250)

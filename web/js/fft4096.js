@@ -85,7 +85,10 @@ export function stftStereo(channels, hop = 1024, maxFrames) {
   const C = Math.min(2, channels.length);
   const T = channels[0].length;
   const framesTotal = Math.max(0, 1 + Math.floor((T - N) / hop));
-  const frames = maxFrames != null ? Math.max(0, Math.min(framesTotal, maxFrames)) : framesTotal;
+  const frames =
+    maxFrames != null
+      ? Math.max(0, Math.min(framesTotal, maxFrames))
+      : framesTotal;
   const bins = (N >> 1) + 1; // 2049
   const out = new Array(C);
   for (let c = 0; c < C; c++) {
