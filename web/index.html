@@ -98,6 +98,10 @@
     </div>
     <pre id="log">Loading...</pre>
     <div id="stemsContainer" style="margin-top: 12px"></div>
+    <div id="abContainer" style="margin-top: 12px">
+      <div id="abAContainer"></div>
+      <div id="abBContainer" style="margin-top: 12px"></div>
+    </div>
     <script type="module">
       // import { createSpleeterWasm } from "./js/spleeter-wasm.js";
       import { resampleTo44100, decodeArrayBufferToPCM } from "./js/audio.js";
@@ -215,10 +219,44 @@
         const cont = document.getElementById("stemsContainer");
         if (cont) cont.innerHTML = "";
       };
-      const renderStems = (payload) => {
+      const drawWaveform = (canvas, data) => {
+        const w = (canvas.width = Math.min(
+          800,
+          Math.max(300, canvas.clientWidth || 600)
+        ));
+        const h = (canvas.height = 60);
+        const ctx = canvas.getContext("2d");
+        ctx.clearRect(0, 0, w, h);
+        ctx.fillStyle = "#f5f5f5";
+        ctx.fillRect(0, 0, w, h);
+        ctx.strokeStyle = "#333";
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        const n = data.length;
+        const samplesPerPx = Math.max(1, Math.floor(n / w));
+        const mid = h / 2;
+        for (let x = 0; x < w; x++) {
+          const start = x * samplesPerPx;
+          const end = Math.min(n, start + samplesPerPx);
+          let min = 1.0,
+            max = -1.0;
+          for (let i = start; i < end; i++) {
+            const v = data[i];
+            if (v < min) min = v;
+            if (v > max) max = v;
+          }
+          const y1 = mid - Math.max(-1, Math.min(1, max)) * (h / 2 - 2);
+          const y2 = mid - Math.max(-1, Math.min(1, min)) * (h / 2 - 2);
+          ctx.moveTo(x + 0.5, y1);
+          ctx.lineTo(x + 0.5, y2);
+        }
+        ctx.stroke();
+      };
+
+      const renderStems = (payload, targetId) => {
         const cont = document.getElementById("stemsContainer");
         if (!cont) return;
-        clearStemPlayers();
+        if (!targetId) clearStemPlayers();
         const stems = payload?.stems || [];
         const sr = payload?.sampleRate || 44100;
         const num = stems.length;
@@ -229,6 +267,18 @@
         };
         const stemNames =
           namesByCount[num] || stems.map((_, i) => `stem${i + 1}`);
+        const target = targetId ? document.getElementById(targetId) : cont;
+        const section = document.createElement("div");
+        section.style.border = "1px solid #ddd";
+        section.style.padding = "8px";
+        section.style.marginTop = "8px";
+        if (payload?.tag) {
+          const h = document.createElement("div");
+          h.textContent = `Result ${payload.tag}`;
+          h.style.fontWeight = "600";
+          h.style.marginBottom = "4px";
+          section.appendChild(h);
+        }
         stems.forEach((data, idx) => {
           const blob = float32ToWavMono(data, sr);
           const url = URL.createObjectURL(blob);
@@ -242,6 +292,11 @@
           audio.src = url;
           audio.style.display = "block";
           audio.style.width = "100%";
+          const canvas = document.createElement("canvas");
+          canvas.style.display = "block";
+          canvas.style.width = "100%";
+          canvas.style.height = "60px";
+          drawWaveform(canvas, data);
           const a = document.createElement("a");
           a.href = url;
           a.download = `${stemNames[idx] || `stem${idx + 1}`}${
@@ -253,9 +308,11 @@
           a.style.marginTop = "2px";
           wrap.appendChild(label);
           wrap.appendChild(audio);
+          wrap.appendChild(canvas);
           wrap.appendChild(a);
-          cont.appendChild(wrap);
+          section.appendChild(wrap);
         });
+        target.appendChild(section);
       };
 
       worker.onmessage = async (e) => {
@@ -327,7 +384,8 @@
         } else if (type === "done") {
           cancelBtn.disabled = true;
           log("Done" + (payload?.tag ? ` [tag=${payload.tag}]` : ""));
-          renderStems(payload);
+          // Normal run: render into main container
+          renderStems(payload, null);
           if (payload?.backend) {
             log(`Backend used: ${payload.backend}`);
             const be = document.getElementById("backendStatus");
@@ -423,41 +481,49 @@
                   }`
                 );
               }
+              // Render A and B into their dedicated containers with waveforms and downloads
+              const abACont = document.getElementById("abAContainer");
+              const abBCont = document.getElementById("abBContainer");
+              if (abACont) abACont.innerHTML = "";
+              if (abBCont) abBCont.innerHTML = "";
+              renderStems(A, "abAContainer");
+              renderStems(B, "abBContainer");
               abState.active = false;
               abState.results = {};
             }
           }
+          // Auto play - only if we have to
           // Quick listen: play first stem mono
-          try {
-            if (payload && payload.stems && payload.stems.length) {
-              const ctx = new (window.AudioContext ||
-                window.webkitAudioContext)();
-              if (ctx.state === "suspended") await ctx.resume();
-              const data = payload.stems[1];
-              const nonZero = data.some((v) => v !== 0);
-              log(`First stem preview: len=${data.length} nonZero=${nonZero}`);
-              let playData = data;
-              if (!nonZero && data.length > 0) {
-                // synthesize a short blip so we know playback works
-                const L = Math.min(4410, data.length); // 0.1s
-                playData = new Float32Array(data.length);
-                for (let i = 0; i < L; i++)
-                  playData[i] = Math.sin((i / L) * Math.PI);
-              }
-              const buffer = ctx.createBuffer(
-                1,
-                playData.length,
-                payload.sampleRate || 44100
-              );
-              buffer.copyToChannel(playData, 0, 0);
-              const src = ctx.createBufferSource();
-              src.buffer = buffer;
-              src.connect(ctx.destination);
-              src.start();
-            }
-          } catch (err) {
-            console.warn("Playback error", err);
-          }
+          // try {
+          //   if (payload && payload.stems && payload.stems.length) {
+          //     const ctx = new (window.AudioContext ||
+          //       window.webkitAudioContext)();
+          //     if (ctx.state === "suspended") await ctx.resume();
+          //     const data = payload.stems[1];
+          //     const nonZero = data.some((v) => v !== 0);
+          //     log(`First stem preview: len=${data.length} nonZero=${nonZero}`);
+          //     let playData = data;
+          //     if (!nonZero && data.length > 0) {
+          //       // synthesize a short blip so we know playback works
+          //       const L = Math.min(4410, data.length); // 0.1s
+          //       playData = new Float32Array(data.length);
+          //       for (let i = 0; i < L; i++)
+          //         playData[i] = Math.sin((i / L) * Math.PI);
+          //     }
+          //     const buffer = ctx.createBuffer(
+          //       1,
+          //       playData.length,
+          //       payload.sampleRate || 44100
+          //     );
+          //     buffer.copyToChannel(playData, 0, 0);
+          //     const src = ctx.createBufferSource();
+          //     src.buffer = buffer;
+          //     src.connect(ctx.destination);
+          //     src.start();
+          //   }
+          // } catch (err) {
+          //   console.warn("Playback error", err);
+          // }
         } else if (type === "model-loaded") {
           const { stems, info, ioDetail } = payload;
           log(`Model loaded: ${stems} stems @ ${info.backend}`);

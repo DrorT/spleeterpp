@@ -35,8 +35,9 @@ function initTables() {
 export function hann() {
   if (hannWindow) return hannWindow;
   hannWindow = new Float32Array(N);
+  // Use periodic Hann to match TensorFlow's hann_window(periodic=True)
   for (let n = 0; n < N; n++) {
-    hannWindow[n] = 0.5 * (1 - Math.cos((2 * Math.PI * n) / (N - 1)));
+    hannWindow[n] = 0.5 * (1 - Math.cos((2 * Math.PI * n) / N));
   }
   return hannWindow;
 }

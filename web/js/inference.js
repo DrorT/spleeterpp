@@ -119,8 +119,8 @@ export class InferenceEngine {
         const i0v = ch0?.imag?.[i0] ?? 0;
         const r1 = ch1?.real?.[i0] ?? 0;
         const i1v = ch1?.imag?.[i0] ?? 0;
-        magArr[dstBase + k * 2 + 0] = Math.log1p(Math.hypot(r0, i0v));
-        magArr[dstBase + k * 2 + 1] = Math.log1p(Math.hypot(r1, i1v));
+        magArr[dstBase + k * 2 + 0] = Math.hypot(r0, i0v);
+        magArr[dstBase + k * 2 + 1] = Math.hypot(r1, i1v);
       }
     }
     const tSpan = Math.min(512, time);

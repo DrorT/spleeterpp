@@ -289,6 +289,54 @@ self.onmessage = async (e) => {
         // Precompute features for first group/slice
         let nextFeaturesB = null;
         let firstBatchLogged = false;
+        // Helper: run a slice through engine, internally tiling if too long
+        const runTiledMono = async (slice, sampleRate, opts) => {
+          const T = slice && slice[0] ? slice[0].length : 0;
+          if (T <= 0)
+            return { stems: new Array(numStems).fill(new Float32Array(0)) };
+          // Empirically safe max window that preserves full activation (~11.9s)
+          const maxWin = (44100 * 11.9) | 0;
+          if (T <= maxWin) return engine.runChunk(slice, sampleRate, opts);
+          const hop = Math.floor(maxWin / 2);
+          const parts = [];
+          for (let s = 0; s < T; s += hop) {
+            const start = s;
+            const end = Math.min(T, start + maxWin);
+            parts.push({ start, end });
+            if (end === T) break;
+          }
+          const partials = [];
+          for (const p of parts) {
+            const sub = slice.map((ch) => ch.subarray(p.start, p.end));
+            const r = await engine.runChunk(sub, sampleRate, opts);
+            partials.push(r.stems);
+          }
+          // OLA stitch for each stem
+          const out = new Array(numStems)
+            .fill(null)
+            .map(() => new Float32Array(T));
+          const weight = new Float32Array(T);
+          // triangular window per part
+          for (let pi = 0; pi < parts.length; pi++) {
+            const p = parts[pi];
+            const len = p.end - p.start;
+            for (let s = 0; s < numStems; s++) {
+              const src = partials[pi][s];
+              for (let t = 0; t < len; t++) {
+                const w = 1 - Math.abs((2 * t) / (len - 1) - 1);
+                out[s][p.start + t] += src[t] * w;
+                if (s === 0) weight[p.start + t] += w; // weight once
+              }
+            }
+          }
+          // normalize
+          for (let t = 0; t < T; t++) {
+            const w = weight[t] > 1e-6 ? 1 / weight[t] : 1;
+            for (let s = 0; s < numStems; s++) out[s][t] *= w;
+          }
+          return { stems: out };
+        };
+
         while (i < chunks.length) {
           if (cancelRequested) {
             self.postMessage({ type: "cancelled" });
@@ -314,14 +362,28 @@ self.onmessage = async (e) => {
             let resB;
             let t0 = performance.now();
             try {
-              resB = await engine.runChunks(slicesB, sampleRate, {
-                stickyBackend: true,
-                forceCpu: preferredBackend === "cpu",
-                featuresB:
-                  nextFeaturesB && nextFeaturesB.length === slicesB.length
-                    ? nextFeaturesB
-                    : undefined,
-              });
+              // If any slice exceeds maxWin, fallback to per-slice tiled single runs
+              const tooLong = slicesB.some((sl) => sl[0].length > 44100 * 11.9);
+              if (tooLong) {
+                const stemsB = [];
+                for (let j = 0; j < group.length; j++) {
+                  const r = await runTiledMono(slicesB[j], sampleRate, {
+                    stickyBackend: true,
+                    forceCpu: preferredBackend === "cpu",
+                  });
+                  stemsB.push(r.stems);
+                }
+                resB = { stemsB };
+              } else {
+                resB = await engine.runChunks(slicesB, sampleRate, {
+                  stickyBackend: true,
+                  forceCpu: preferredBackend === "cpu",
+                  featuresB:
+                    nextFeaturesB && nextFeaturesB.length === slicesB.length
+                      ? nextFeaturesB
+                      : undefined,
+                });
+              }
               if (!firstBatchLogged && verbose) {
                 firstBatchLogged = true;
                 self.postMessage({
@@ -410,7 +472,7 @@ self.onmessage = async (e) => {
               channels.map((ch) => ch.subarray(nextC.start, nextC.end));
             const nextFeatPromise = nextSlice ? precompute(nextSlice) : null;
             let t0 = performance.now();
-            const result = await engine.runChunk(slice, sampleRate, {
+            const result = await runTiledMono(slice, sampleRate, {
               stickyBackend: true,
               forceCpu: preferredBackend === "cpu",
               features: nextFeaturesB || (await nextFeatPromise),
