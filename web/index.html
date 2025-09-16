@@ -30,6 +30,16 @@
       <span id="glInfo" style="margin-left: 12px; color: #666"
         >GL: —</span
       >
+      <label style="margin-left: 12px"
+        >Backend:
+        <select id="backendSelect" style="width: 110px">
+          <option value="auto" selected>auto</option>
+          <option value="webgl">webgl</option>
+          <option value="webgpu">webgpu</option>
+          <option value="wasm">wasm</option>
+          <option value="cpu">cpu</option>
+        </select>
+      </label>
       <span id="windowInfo" style="margin-left: 12px; color: #666"
         >Window: —</span
       >
@@ -46,7 +56,7 @@
           type="number"
           min="2"
           max="20"
-          value="30"
+          value="11.88"
           style="width: 60px"
           <label
             >WebGL tuning:
@@ -112,7 +122,7 @@
             type="number"
             min="1"
             max="8"
-            value="3"
+            value="1"
             style="width: 60px"
           />
         </label>
@@ -123,7 +133,7 @@
             type="number"
             min="1"
             max="8"
-            value="2"
+            value="1"
             style="width: 60px"
           />
         </label>
@@ -311,6 +321,17 @@
         });
         log(`[ui] backend preference: ${force ? "cpu" : "auto"}`);
       });
+      const backendSelect = document.getElementById("backendSelect");
+      if (backendSelect) {
+        backendSelect.addEventListener("change", () => {
+          const pref = backendSelect.value || "auto";
+          worker.postMessage({
+            type: "set-backend",
+            payload: { preference: pref },
+          });
+          log(`[ui] backend preference: ${pref}`);
+        });
+      }
       // Simple event-loop lag monitor
       let lastTick = performance.now();
       setInterval(() => {
@@ -451,11 +472,17 @@
           return;
         }
         if (type === "backend-set") {
-          const { backend } = payload || {};
+          const { backend, attempts } = payload || {};
           if (backend) {
             const be = document.getElementById("backendStatus");
             if (be) be.textContent = `Backend: ${backend}`;
             log(`[worker] backend set to ${backend}`);
+            if (attempts && attempts.length) {
+              const s = attempts
+                .map((a) => `${a.name}:${a.ok ? "ok" : "fail"}`)
+                .join(" → ");
+              log(`[worker] backend attempts: ${s}`);
+            }
           }
           return;
         }

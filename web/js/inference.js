@@ -51,7 +51,7 @@ export class InferenceEngine {
     const tf = await ensureTF();
     // Prefer GPU (WebGL) if available; fall back to CPU on failure
     try {
-      await configureBackend("auto"); // tries webgl, then falls back to cpu
+      await configureBackend("auto"); // tries webgl, then wasm, then cpu
     } catch (_) {
       try {
         await configureBackend("cpu");
@@ -964,6 +964,9 @@ export class InferenceEngine {
     let usedPath = "minimal";
     let usedInputsRef = minimalInputs;
     try {
+      const hasComplexInputs = (this.model.inputs || []).some(
+        (i) => i && i.dtype === "complex64"
+      );
       const fetches = this._stemOutputNames(this.numStems);
       const tExec0 =
         typeof performance !== "undefined" && performance.now
@@ -972,9 +975,11 @@ export class InferenceEngine {
       let triedWebGL = false;
       let execBackend = tf.getBackend();
       const prevBackend = execBackend;
-      // Try switch to WebGL just for model execution (unless forceCpu)
+      // Try switch to WebGL just for model execution (unless forceCpu or lockBackend)
       try {
-        if (opts?.forceCpu) {
+        const allowWebglOverride =
+          prevBackend === "wasm" && hasComplexInputs === true;
+        if (opts?.forceCpu || (opts?.lockBackend && !allowWebglOverride)) {
           triedWebGL = false;
           execBackend = tf.getBackend();
           throw new Error("forceCpu enabled");
@@ -1133,10 +1138,10 @@ export class InferenceEngine {
           }
         }
       }
-      // Restore to CPU after exec if we switched and not sticky
+      // Restore previous backend (e.g., WASM) after exec when we temporarily switched to WebGL
       try {
-        if (triedWebGL && !opts?.stickyBackend) {
-          await tf.setBackend("cpu");
+        if (triedWebGL && prevBackend !== "webgl") {
+          await tf.setBackend(prevBackend);
           await tf.ready();
         }
       } catch (_) {}
@@ -1158,6 +1163,18 @@ export class InferenceEngine {
         typeof performance !== "undefined" && performance.now
           ? performance.now()
           : Date.now();
+      // Ensure backend compatibility for complex64 placeholders on WASM
+      const hasComplexInputsB = (this.model.inputs || []).some(
+        (i) => i && i.dtype === "complex64"
+      );
+      let prevBackendForComplexB = null;
+      try {
+        if (tf.getBackend() === "wasm" && hasComplexInputsB) {
+          prevBackendForComplexB = "wasm";
+          await tf.setBackend("cpu");
+          await tf.ready();
+        }
+      } catch (_) {}
       const inputsDict = await buildAllInputs();
       const tAllIn1 =
         typeof performance !== "undefined" && performance.now
@@ -1177,7 +1194,10 @@ export class InferenceEngine {
       let execBackend = tf.getBackend();
       const prevBackend = execBackend;
       try {
-        if (opts?.forceCpu) {
+        const allowWebglOverrideB =
+          prevBackend === "wasm" &&
+          (this.model.inputs || []).some((i) => i && i.dtype === "complex64");
+        if (opts?.forceCpu || (opts?.lockBackend && !allowWebglOverrideB)) {
           triedWebGL = false;
           execBackend = tf.getBackend();
           throw new Error("forceCpu enabled");
@@ -1334,8 +1354,22 @@ export class InferenceEngine {
           }
         }
       }
+      // Restore to previous backend after exec (e.g., WASM)
       try {
-        if (triedWebGL && !opts?.stickyBackend) {
+        if (triedWebGL && prevBackend !== "webgl") {
+          await tf.setBackend(prevBackend);
+          await tf.ready();
+        }
+      } catch (_) {}
+      // Restore WASM if we temporarily switched due to complex inputs
+      try {
+        if (prevBackendForComplexB === "wasm") {
+          await tf.setBackend("wasm");
+          await tf.ready();
+        }
+      } catch (_) {}
+      try {
+        if (triedWebGL && !opts?.stickyBackend && !opts?.lockBackend) {
           await tf.setBackend("cpu");
           await tf.ready();
         }

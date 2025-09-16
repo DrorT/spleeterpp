@@ -1,0 +1,12 @@
+{
+  "name": "spleeterpp-web-dev",
+  "private": true,
+  "version": "0.0.0",
+  "description": "Dev server for Spleeter WASM demo with COOP/COEP headers",
+  "scripts": {
+    "start": "node dev-server.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2"
+  }
+}

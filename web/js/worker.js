@@ -136,11 +136,21 @@ self.onmessage = async (e) => {
     }
     case "set-backend": {
       try {
-        preferredBackend = payload?.preference === "cpu" ? "cpu" : "auto";
+        const pref = String(payload?.preference || "auto");
+        preferredBackend = [
+          "auto",
+          "cpu",
+          "webgl",
+          "webgpu",
+          "wasm",
+          "gpu",
+        ].includes(pref)
+          ? pref
+          : "auto";
         const info = await configureBackend(preferredBackend);
         self.postMessage({
           type: "backend-set",
-          payload: { backend: info.backend },
+          payload: { backend: info.backend, attempts: info.attempts },
         });
       } catch (err) {
         self.postMessage({
@@ -180,6 +190,10 @@ self.onmessage = async (e) => {
       try {
         const stems = Number(payload?.stems || 2);
         self.postMessage({ type: "model-loading", payload: { stems } });
+        // Ensure backend is configured before model load
+        try {
+          await configureBackend(preferredBackend);
+        } catch (_) {}
         const engine = new InferenceEngine({ numStems: stems });
         const info = await engine.load(stems);
         // cache current engine by stems count if needed later
@@ -503,6 +517,8 @@ self.onmessage = async (e) => {
               const batched = await engine.runChunks(subSlicesB, sampleRate, {
                 stickyBackend: !!opts?.stickyBackend,
                 forceCpu: !!opts?.forceCpu,
+                lockBackend:
+                  preferredBackend === "wasm" || preferredBackend === "cpu",
               });
               const tG1 = performance.now();
               tileComputeMs += tG1 - tG0;
@@ -644,6 +660,8 @@ self.onmessage = async (e) => {
                 resB = await engine.runChunks(slicesB, sampleRate, {
                   stickyBackend: true,
                   forceCpu: preferredBackend === "cpu",
+                  lockBackend:
+                    preferredBackend === "wasm" || preferredBackend === "cpu",
                   featuresB:
                     nextFeaturesB && nextFeaturesB.length === slicesB.length
                       ? nextFeaturesB
@@ -669,6 +687,8 @@ self.onmessage = async (e) => {
                 const res = await engine.runChunk(slice, sampleRate, {
                   stickyBackend: true,
                   forceCpu: preferredBackend === "cpu",
+                  lockBackend:
+                    preferredBackend === "wasm" || preferredBackend === "cpu",
                 });
                 const tS1 = performance.now();
                 for (let s = 0; s < numStems; s++)
@@ -750,6 +770,8 @@ self.onmessage = async (e) => {
             const result = await runTiledMono(slice, sampleRate, {
               stickyBackend: true,
               forceCpu: preferredBackend === "cpu",
+              lockBackend:
+                preferredBackend === "wasm" || preferredBackend === "cpu",
               features: nextFeaturesB || (await nextFeatPromise),
               settings: effSettings,
               tag: reqTag,
