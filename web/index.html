@@ -27,6 +27,9 @@
       <span id="backendStatus" style="margin-left: 12px; color: #666"
         >Backend: —</span
       >
+      <span id="glInfo" style="margin-left: 12px; color: #666"
+        >GL: —</span
+      >
       <span id="windowInfo" style="margin-left: 12px; color: #666"
         >Window: —</span
       >
@@ -45,6 +48,16 @@
           max="20"
           value="30"
           style="width: 60px"
+          <label
+            >WebGL tuning:
+            <select id="webglTuning" style="width: 160px">
+              <option value="default" selected>Default</option>
+              <option value="v2_pack">WebGL2 + PACK</option>
+              <option value="v2_f16">WebGL2 + F16</option>
+              <option value="v1_pack">WebGL1 + PACK</option>
+            </select>
+          </label>
+          <button id="applyTuningBtn" style="margin-left: 6px">Apply</button>
       /></label>
       <button id="setIdealBtn" style="margin-left: 8px">Use Ideal</button>
       <label style="margin-left: 12px"
@@ -204,6 +217,25 @@
           if (gpuEl)
             gpuEl.textContent = ok ? "GPU: WebGL available" : "GPU: CPU only";
           log(`[ui] GPU/WebGL available: ${ok ? "yes" : "no"}`);
+          // Probe vendor/renderer
+          try {
+            const canvas = document.createElement("canvas");
+            const gl =
+              canvas.getContext("webgl2") || canvas.getContext("webgl");
+            if (gl) {
+              const dbgExt = gl.getExtension("WEBGL_debug_renderer_info");
+              const vendor = dbgExt
+                ? gl.getParameter(dbgExt.UNMASKED_VENDOR_WEBGL)
+                : gl.getParameter(gl.VENDOR);
+              const renderer = dbgExt
+                ? gl.getParameter(dbgExt.UNMASKED_RENDERER_WEBGL)
+                : gl.getParameter(gl.RENDERER);
+              const glInfo = document.getElementById("glInfo");
+              if (glInfo)
+                glInfo.textContent = `GL: ${vendor} / ${renderer}`;
+              log(`[ui] GL vendor/renderer: ${vendor} / ${renderer}`);
+            }
+          } catch (_) {}
         } catch (e) {
           const gpuEl = document.getElementById("gpuStatus");
           if (gpuEl) gpuEl.textContent = "GPU: probe failed";
@@ -667,6 +699,13 @@
               payload.stems
             } stems ${payload.ok ? "OK" : "FAIL"}`
           );
+        } else if (type === "webgl-tuning-set") {
+          const { backend, opts } = payload || {};
+          log(
+            `WebGL tuning applied (${JSON.stringify(
+              opts
+            )}); backend=${backend}`
+          );
         } else if (type === "models-preloaded") {
           const okCount = (payload.results || []).filter((r) => r.ok).length;
           log(
@@ -803,6 +842,23 @@
           payload: { stemsList: [2, 4, 5] },
         });
       };
+
+      // Apply WebGL tuning flags
+      const applyTuningBtn = document.getElementById("applyTuningBtn");
+      const webglTuning = document.getElementById("webglTuning");
+      if (applyTuningBtn && webglTuning) {
+        applyTuningBtn.onclick = () => {
+          const sel = webglTuning.value;
+          let opts = {};
+          if (sel === "v2_pack") opts = { webglVersion: 2, pack: true };
+          else if (sel === "v2_f16")
+            opts = { webglVersion: 2, pack: true, forceF16: true };
+          else if (sel === "v1_pack") opts = { webglVersion: 1, pack: true };
+          else opts = {};
+          log(`[ui] apply WebGL tuning: ${JSON.stringify(opts)}`);
+          worker.postMessage({ type: "set-webgl-tuning", payload: opts });
+        };
+      }
 
       // Verbose toggle: inform worker to enable/disable debug messages
       verboseChk.onchange = () => {

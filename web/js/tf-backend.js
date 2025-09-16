@@ -73,5 +73,7 @@ export async function applyWebGLTuning(opts = {}) {
   if (typeof pack === "boolean") safeSet("WEBGL_PACK", pack);
   if (webglVersion === 1 || webglVersion === 2)
     safeSet("WEBGL_VERSION", webglVersion);
+  if (opts && typeof opts.forceF16 === "boolean")
+    safeSet("WEBGL_FORCE_F16_TEXTURES", !!opts.forceF16);
   return true;
 }

@@ -2,7 +2,7 @@
 
 import { planChunks, overlapAddStitchMono } from "./chunking.js";
 import { InferenceEngine } from "./inference.js";
-import { configureBackend } from "./tf-backend.js";
+import { configureBackend, applyWebGLTuning } from "./tf-backend.js";
 
 let cancelRequested = false;
 let verbose = false;
@@ -146,6 +146,24 @@ self.onmessage = async (e) => {
         self.postMessage({
           type: "error",
           payload: makeErrorPayload(err, "set-backend"),
+        });
+      }
+      return;
+    }
+    case "set-webgl-tuning": {
+      try {
+        const opts = payload && typeof payload === "object" ? payload : {};
+        await applyWebGLTuning(opts);
+        // Re-apply backend so flags take effect if needed
+        const info = await configureBackend(preferredBackend);
+        self.postMessage({
+          type: "webgl-tuning-set",
+          payload: { ok: true, opts, backend: info.backend },
+        });
+      } catch (err) {
+        self.postMessage({
+          type: "error",
+          payload: makeErrorPayload(err, "set-webgl-tuning"),
         });
       }
       return;
