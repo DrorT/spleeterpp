@@ -1,6 +1,6 @@
 // Web Worker: orchestrates decode -> resample -> chunk -> (inference placeholder)
 
-import { planChunks, overlapAddStitchMono } from "./chunking.js";
+import { planChunks, overlapAddStitchMono, planChunksWithPadding, overlapAddStitchMonoWithPadding } from "./chunking.js";
 import { InferenceEngine } from "./inference.js";
 import { configureBackend, applyWebGLTuning } from "./tf-backend.js";
 
@@ -291,7 +291,8 @@ self.onmessage = async (e) => {
               ).toFixed(2)}ms`,
             },
           });
-        const chunks = planChunks(frames, chunkSize, hopSize);
+        // Use pre-padded chunking strategy to fix missing audio at beginning and end
+        const chunks = planChunksWithPadding(frames, chunkSize, hopSize);
         const tPlan0 = performance.now();
         self.postMessage({
           type: "planned",
@@ -814,9 +815,9 @@ self.onmessage = async (e) => {
             i += 1;
           }
         }
-        // Stitch per-stem results (mono only for now)
-        const stitched = perStemOutputs.map((chunks) =>
-          overlapAddStitchMono(chunks, frames, chunkSize, hopSize)
+        // Stitch per-stem results using pre-padded overlap-add to fix missing audio
+        const stitched = perStemOutputs.map((outputs, stemIndex) =>
+          overlapAddStitchMonoWithPadding(chunks, outputs, frames, chunkSize, hopSize)
         );
         const computeStats = (arr) => {
           const n = arr.length;

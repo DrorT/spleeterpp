@@ -12,6 +12,45 @@ export function planChunks(totalFrames, chunkSize, hopSize) {
   return chunks;
 }
 
+// Enhanced chunk planner with pre-padding strategy
+export function planChunksWithPadding(totalFrames, chunkSize, hopSize) {
+  if (chunkSize <= 0) return [{ start: 0, end: totalFrames }];
+  const hop = hopSize > 0 ? hopSize : chunkSize;
+  const fadeLength = Math.max(0, chunkSize - hopSize);
+  
+  // If no overlap/fade, use original planChunks
+  if (fadeLength === 0) {
+    return planChunks(totalFrames, chunkSize, hopSize);
+  }
+  
+  const chunks = [];
+  
+  // Add pre-padding chunk (silent region before the first real chunk)
+  chunks.push({ 
+    start: -fadeLength, 
+    end: 0, 
+    isPadding: true, 
+    paddingType: 'pre' 
+  });
+  
+  // Add regular chunks
+  for (let start = 0; start < totalFrames; start += hop) {
+    const end = Math.min(start + chunkSize, totalFrames);
+    chunks.push({ start, end, isPadding: false });
+    if (end === totalFrames) break;
+  }
+  
+  // Add post-padding chunk (silent region after the last real chunk)
+  chunks.push({ 
+    start: totalFrames, 
+    end: totalFrames + fadeLength, 
+    isPadding: true, 
+    paddingType: 'post' 
+  });
+  
+  return chunks;
+}
+
 export function overlapAddStitchMono(outputs, totalFrames, chunkSize, hopSize) {
   const out = new Float32Array(totalFrames);
   const acc = new Float32Array(totalFrames);
@@ -41,4 +80,23 @@ export function overlapAddStitchMono(outputs, totalFrames, chunkSize, hopSize) {
     if (a > 1e-12) out[i] /= a;
   }
   return out;
+}
+
+// Enhanced overlap-add stitch function that works with padded chunks
+export function overlapAddStitchMonoWithPadding(chunks, outputs, originalTotalFrames, chunkSize, hopSize) {
+  const fadeLength = Math.max(0, chunkSize - hopSize);
+  
+  // If no fade/overlap, use original function
+  if (fadeLength === 0) {
+    return overlapAddStitchMono(outputs, originalTotalFrames, chunkSize, hopSize);
+  }
+  
+  // Extract only the real chunks (excluding padding chunks) and use standard overlap-add
+  const realChunks = chunks.filter(c => !c.isPadding);
+  const realOutputs = outputs.filter((_, i) => !chunks[i].isPadding);
+  
+  // Use the standard overlap-add function on the real chunks
+  const result = overlapAddStitchMono(realOutputs, originalTotalFrames, chunkSize, hopSize);
+  
+  return result;
 }
